@@ -1,0 +1,22 @@
+{
+    "name": "hub-linerobot-core",
+    "description": "The base module for the Hub Line Robot",
+    "version": "0.1.0",
+    "dependencies": {
+        "hub-robot-core": "git@github.com:demo-ninjas/hub-robot-core.git",
+        "hub-robot-http-utils": "git@github.com:demo-ninjas/hub-robot-http-utils.git",
+        "hub-robot-oled": "git@github.com:demo-ninjas/hub-robot-oled.git"
+    },
+    "authors": [
+        {
+            "name": "Adam Strickland",
+            "email": "astrickland@microsoft.com"
+        }
+    ],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/demo-ninjas/hub-linerobot-core"
+    },
+    "frameworks": ["arduino"],
+    "platforms": ["espressif32"]
+}
