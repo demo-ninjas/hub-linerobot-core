@@ -12,7 +12,6 @@
 #include <serial_proxy.hpp>
 #include <shift_register.h>
 #include <dc_motor.h>
-#include <ADS7828/i2c_adc_ads7828.h>
 #include <LIS3DH/SparkFunLIS3DH.h>
 #include <button.h>
 
