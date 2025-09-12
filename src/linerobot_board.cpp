@@ -28,14 +28,8 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger, St
     Serial.println("Line Robot: Initialising");
     
 
-    // Initialise the EEPROM
-    if (!EEPROM.begin(512)) { // Allocate 512 bytes for EEPROM
-        Serial.println("Failed to initialize EEPROM - will not be able to save IR sensor baselines");
-        this->eeprom_valid = false;
-    } else {
-        Serial.println("EEPROM initialized");
-        this->eeprom_valid = true;
-    }
+    // Initialise the NVS (EEPROM emulation for ESP32)
+    this->eeprom_valid = this->preferences.begin("hubrobot", false);
 
     // If the ssid has been set, then we can setup the Wifi Manager + HTTP Server
     if (wifi_ssid.length() > 0) {
@@ -90,6 +84,8 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger, St
 }
 
 LineRobotBoard::~LineRobotBoard() {
+    this->preferences.end();
+    
     this->oled->clear(false);
     if (this->wifi_man) {
         this->wifi_man->disconnect();
@@ -243,13 +239,13 @@ void LineRobotBoard::initInfraredSensors(int ir_threshold) {
     // Set the baseline for each sensor
     int baselines[4] = {0,0,0,0};
     if (this->eeprom_valid) {
-        // Read the baselines from the EEPROM
+        // Read the baselines from the NVS
         for (int i = 0; i < 4; i++) {
-            // Load the Baselines from the EEPROM
-            baselines[i] = EEPROM.read(i * 2) | (EEPROM.read(i * 2 + 1) << 8);
+            // Load the Baselines from the NVS
+            baselines[i] = this->preferences.getUInt(("ir_" + String(i)).c_str(), 0  /* default value */);
             if (baselines[i] < 0 || baselines[i] > 4095) {
                 baselines[i] = 0; // Invalid baseline, reset to 0
-                this->logger->println("Invalid baseline for IR sensor " + String(i) + ", resetting to 0");
+                this->logger->println("Invalid baseline for IR sensor " + String(i) + ", resetting to 0 [value was " + String(baselines[i]) + "]");
             }
         }
     } else {
@@ -525,13 +521,11 @@ void LineRobotBoard::baselineIRSensors() {
     // Write the baselines to the EEPROM
     if (this->eeprom_valid) {
         for (int i = 0; i < 4; i++) {
-            EEPROM.write(i * 2, baselines[i] & 0xFF);         // Low byte
-            EEPROM.write(i * 2 + 1, (baselines[i] >> 8) & 0xFF); // High byte
+            this->preferences.putUInt(("ir_" + String(i)).c_str(), baselines[i]);
         }
-        EEPROM.commit();
-        this->logger->println("IR Sensor Baselines saved to EEPROM: " + String(baselines[0]) + ", " + String(baselines[1]) + ", " + String(baselines[2]) + ", " + String(baselines[3]));
+        this->logger->println("IR Sensor Baselines saved to NVS: " + String(baselines[0]) + ", " + String(baselines[1]) + ", " + String(baselines[2]) + ", " + String(baselines[3]));
     } else {
-        this->logger->println("EEPROM not valid, wiull not save IR Sensor Baselines");
+        this->logger->println("NVS not valid, will not save IR Sensor Baselines");
     }
 
     delay(500);

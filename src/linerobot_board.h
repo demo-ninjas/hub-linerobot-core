@@ -5,7 +5,7 @@
 #define BOARD_TYPE "ESP32"
 
 #include <Arduino.h>
-#include <EEPROM.h>
+#include <Preferences.h>
 #include "linerobot_state.h"
 #include <wifi_manager.h>
 #include <http_server.h>
@@ -61,6 +61,7 @@ class LineRobotBoard {
         unsigned long tick2_count;
 
         bool eeprom_valid;
+        Preferences preferences;
 
         ShiftRegister* shift_register;
         DCMotor* motor_left;
