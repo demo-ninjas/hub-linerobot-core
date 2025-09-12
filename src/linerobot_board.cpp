@@ -200,6 +200,16 @@ void LineRobotBoard::setupTimersAndTasks() {
     timer_start(TIMER_GROUP_0, TIMER_1); // Start timer1
 }
 
+void LineRobotBoard::pauseTimersAndTasks() {
+    timer_pause(TIMER_GROUP_0, TIMER_0);
+    timer_pause(TIMER_GROUP_0, TIMER_1);
+}
+
+void LineRobotBoard::resumeTimersAndTasks() {
+    timer_start(TIMER_GROUP_0, TIMER_0);
+    timer_start(TIMER_GROUP_0, TIMER_1);
+}
+
 void LineRobotBoard::initAccelerometer() {
     this->lis3dh->settings.adcEnabled = 0;
     this->lis3dh->settings.tempEnabled = 0;
@@ -242,8 +252,8 @@ void LineRobotBoard::initInfraredSensors(int ir_threshold) {
         // Read the baselines from the NVS
         for (int i = 0; i < 4; i++) {
             // Load the Baselines from the NVS
-            baselines[i] = this->preferences.getUInt(("ir_" + String(i)).c_str(), 0  /* default value */);
-            if (baselines[i] < 0 || baselines[i] > 4095) {
+            baselines[i] = this->preferences.getInt(("ir_" + String(i)).c_str(), 0  /* default value */);
+            if (baselines[i] < -4095 || baselines[i] > 4095) {
                 baselines[i] = 0; // Invalid baseline, reset to 0
                 this->logger->println("Invalid baseline for IR sensor " + String(i) + ", resetting to 0 [value was " + String(baselines[i]) + "]");
             }
@@ -446,6 +456,18 @@ void LineRobotBoard::onBoardButtonDoublePressedHandler(long timeBetweenPresses) 
         }
     }
 
+    if (this->state->currentState() == LINE_ROBOT_BASELINE_INIT) {
+        // Double press during baseline init will clear the currently saved baseline and return to IDLE state
+        pauseTimersAndTasks();
+        delay(100);
+        for (int i = 0; i < 4; i++) {
+            this->ir_sensors[i]->setBaseline(0);                        // Clear the live baseline
+            this->preferences.putInt(("ir_" + String(i)).c_str(), 0);   // Clear the saved baseline
+        }
+        delay(100);
+        resumeTimersAndTasks();
+        this->state->setState(LINE_ROBOT_IDLE);
+    }
     if (this->debug && this->logger) {
         this->logger->println("Board Button Double Pressed: " + String(timeBetweenPresses));
     }
@@ -466,6 +488,7 @@ void LineRobotBoard::onBoardButtonLongPressedHandler(long timePressed) {
         this->state->setState(LINE_ROBOT_BASELINE_INIT);
         this->preBaseline();
     } else if (this->state->currentState() == LINE_ROBOT_BASELINE_INIT) {
+        // Return to IDLE state
         this->state->setState(LINE_ROBOT_IDLE); // Long press returns to IDLE state
     } else if (this->state->currentState() == LINE_ROBOT_PRIMED) {
         this->state->setState(LINE_ROBOT_IDLE); // Long press returns to IDLE state
@@ -498,7 +521,7 @@ void LineRobotBoard::baselineIRSensors() {
 
     // Set the baseline for each sensor
     unsigned long start_time = millis();
-    int baseline_sums[4];
+    int baseline_sums[4] = {0,0,0,0};
     int count = 0;
     while (millis() - start_time < 1000) { // Wait for 2 seconds
         for (int i = 0; i < 4; i++) {
@@ -514,15 +537,20 @@ void LineRobotBoard::baselineIRSensors() {
     for (int i = 0; i < 4; i++) {
         int baseline = baseline_sums[i] / count;
         this->oled->setLine(i+1, "IR" + String(i) + ": " + String(baseline), false);
+        this->logger->println("IR Sensor " + String(i) + " Baseline: " + String(baseline) + " (avg of " + String(count) + " samples, Sum: " + String(baseline_sums[i]) + ")");
         this->ir_sensors[i]->setBaseline(baseline);
         baselines[i] = baseline;
     }
 
     // Write the baselines to the EEPROM
     if (this->eeprom_valid) {
+        pauseTimersAndTasks();
+        delay(100);
         for (int i = 0; i < 4; i++) {
-            this->preferences.putUInt(("ir_" + String(i)).c_str(), baselines[i]);
+            this->preferences.putInt(("ir_" + String(i)).c_str(), baselines[i]);
         }
+        delay(100);
+        resumeTimersAndTasks();
         this->logger->println("IR Sensor Baselines saved to NVS: " + String(baselines[0]) + ", " + String(baselines[1]) + ", " + String(baselines[2]) + ", " + String(baselines[3]));
     } else {
         this->logger->println("NVS not valid, will not save IR Sensor Baselines");

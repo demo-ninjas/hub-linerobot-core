@@ -93,6 +93,9 @@ class LineRobotBoard {
         void preBaseline();
 
         void setupTimersAndTasks();
+        void pauseTimersAndTasks();
+        void resumeTimersAndTasks();
+
          /**
          * @brief Tick the main sensor task - on the second CPU core (Core1) - it assumes that the ESP32 core tasks are running on the first core and will not block them
          */
