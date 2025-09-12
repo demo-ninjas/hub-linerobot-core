@@ -5,6 +5,7 @@
 #define BOARD_TYPE "ESP32"
 
 #include <Arduino.h>
+#include <EEPROM.h>
 #include "linerobot_state.h"
 #include <wifi_manager.h>
 #include <http_server.h>
@@ -59,6 +60,8 @@ class LineRobotBoard {
         unsigned long tick1_count;
         unsigned long tick2_count;
 
+        bool eeprom_valid;
+
         ShiftRegister* shift_register;
         DCMotor* motor_left;
         DCMotor* motor_right;
@@ -77,7 +80,7 @@ class LineRobotBoard {
         void initMotors();
         void initADC();
         void initAccelerometer();
-        void initInfraredSensors();
+        void initInfraredSensors(int ir_threshold);
 
         void tickInfraredSensors();
         void tickAccelerometer();
@@ -116,8 +119,11 @@ class LineRobotBoard {
          * @brief Initialize the board and start its internal tasks
          * @note This function will initialize the board and all of its components
          * @note This function will block until the initialization is complete
+         * @param ir_threshold The threshold value for the IR sensors (default: 400)
+         * @note The IR sensor threshold is the value that the (baseline adjusted) value of the IR sensor must be above to be considered triggered
+         * @note You should call this function after setting up any HTTP routes you want to add to the server
          */
-        void begin();
+        void begin(int ir_threshold = 400); // Default IR threshold is 400
        
         /**
          * @brief Set the debug mode for the board

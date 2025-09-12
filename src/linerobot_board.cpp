@@ -27,6 +27,16 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger, St
     }
     Serial.println("Line Robot: Initialising");
     
+
+    // Initialise the EEPROM
+    if (!EEPROM.begin(512)) { // Allocate 512 bytes for EEPROM
+        Serial.println("Failed to initialize EEPROM - will not be able to save IR sensor baselines");
+        this->eeprom_valid = false;
+    } else {
+        Serial.println("EEPROM initialized");
+        this->eeprom_valid = true;
+    }
+
     // If the ssid has been set, then we can setup the Wifi Manager + HTTP Server
     if (wifi_ssid.length() > 0) {
         // Setup the HTTP Server
@@ -100,7 +110,7 @@ LineRobotBoard::~LineRobotBoard() {
     delete this->lis3dh;
 }
 
-void LineRobotBoard::begin() {
+void LineRobotBoard::begin(int ir_threshold) {
     this->logger->println("Line Robot Board: Starting...");
     this->oled->init();
     this->logger->println("Line Robot Board: OLED Initialized");
@@ -119,7 +129,7 @@ void LineRobotBoard::begin() {
     this->logger->println("Line Robot Board: Initializing Accelerometer...");
     this->initAccelerometer();
     this->logger->println("Line Robot Board: Initializing Infrared Sensors...");
-    this->initInfraredSensors();
+    this->initInfraredSensors(ir_threshold);
 
     // Setup Core Tasks
     this->logger->println("Line Robot Board: Setting up Timers and Tasks...");
@@ -229,12 +239,31 @@ void LineRobotBoard::initShiftRegister() {
     this->shift_register->set(15, 0); // Set the last bit to 0
 }
 
-void LineRobotBoard::initInfraredSensors() {
+void LineRobotBoard::initInfraredSensors(int ir_threshold) {
     // Set the baseline for each sensor
-    this->ir_sensors[0] = new InfraredSensor(4, 6, 8, 400);
-    this->ir_sensors[1] = new InfraredSensor(5, 3, 9, 400);
-    this->ir_sensors[2] = new InfraredSensor(6, 4, 10, 400);
-    this->ir_sensors[3] = new InfraredSensor(7, 7, 11, 400);
+    int baselines[4] = {0,0,0,0};
+    if (this->eeprom_valid) {
+        // Read the baselines from the EEPROM
+        for (int i = 0; i < 4; i++) {
+            // Load the Baselines from the EEPROM
+            baselines[i] = EEPROM.read(i * 2) | (EEPROM.read(i * 2 + 1) << 8);
+            if (baselines[i] < 0 || baselines[i] > 4095) {
+                baselines[i] = 0; // Invalid baseline, reset to 0
+                this->logger->println("Invalid baseline for IR sensor " + String(i) + ", resetting to 0");
+            }
+        }
+    } else {
+        // If the EEPROM is not valid, just set all baselines to 0
+        for (int i = 0; i < 4; i++) {
+            baselines[i] = 0;
+        }
+    }
+
+    this->ir_sensors[0] = new InfraredSensor(4, 6, 8, ir_threshold, baselines[0]);
+    this->ir_sensors[1] = new InfraredSensor(5, 3, 9, ir_threshold, baselines[1]);
+    this->ir_sensors[2] = new InfraredSensor(6, 4, 10, ir_threshold, baselines[2]);
+    this->ir_sensors[3] = new InfraredSensor(7, 7, 11, ir_threshold, baselines[3]);
+    this->logger->println("IR Sensors Initialised with Baselines: " + String(baselines[0]) + ", " + String(baselines[1]) + ", " + String(baselines[2]) + ", " + String(baselines[3]));
 
     // Turn on the IR LEDs for each Sensor
     for (int i = 0; i < 4; i++) {
@@ -399,7 +428,7 @@ void LineRobotBoard::onBoardButtonPressedHandler(long timePressed) {
         this->logger->println("Board Button Pressed: " + String(timePressed));
     }
 
-    if (this->state->currentState() == LINE_ROBOT_IDLE && this->state->pose.x > 0.70) {
+    if (this->state->currentState() == LINE_ROBOT_IDLE && (this->state->pose.x > 0.80 || this->state->pose.x < -0.80)) {
         // The button was pressed when the robot was IDLE and held mostly vertically
         this->state->setState(LINE_ROBOT_BASELINE_INIT);
         this->preBaseline();
@@ -485,10 +514,24 @@ void LineRobotBoard::baselineIRSensors() {
     }
     
     this->oled->setLine(0, "Baseline Complete", true);
+    int baselines[4] = {0,0,0,0};
     for (int i = 0; i < 4; i++) {
         int baseline = baseline_sums[i] / count;
         this->oled->setLine(i+1, "IR" + String(i) + ": " + String(baseline), false);
         this->ir_sensors[i]->setBaseline(baseline);
+        baselines[i] = baseline;
+    }
+
+    // Write the baselines to the EEPROM
+    if (this->eeprom_valid) {
+        for (int i = 0; i < 4; i++) {
+            EEPROM.write(i * 2, baselines[i] & 0xFF);         // Low byte
+            EEPROM.write(i * 2 + 1, (baselines[i] >> 8) & 0xFF); // High byte
+        }
+        EEPROM.commit();
+        this->logger->println("IR Sensor Baselines saved to EEPROM: " + String(baselines[0]) + ", " + String(baselines[1]) + ", " + String(baselines[2]) + ", " + String(baselines[3]));
+    } else {
+        this->logger->println("EEPROM not valid, wiull not save IR Sensor Baselines");
     }
 
     delay(500);
