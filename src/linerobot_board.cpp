@@ -370,7 +370,11 @@ void LineRobotBoard::tickInfraredSensors() {
     // This function on average takes 1ms to run (the ADC update is slow)
     for (int i = 0; i < 4; i++) {
         this->ir_sensors[i]->tick(true);
-        this->shift_register->set(this->ir_sensors[i]->indicator_led_num, this->ir_sensors[i]->is_triggered, false);
+        // Update the indicator LED for the sensor (if not in PRIMED state)
+        if (this->state->currentState() != LINE_ROBOT_PRIMED) {
+            this->shift_register->set(this->ir_sensors[i]->indicator_led_num, this->ir_sensors[i]->is_triggered, false);
+        }
+        
         // Update the state of the IR sensors
         // The IR sensors are in the order: outer right, inner right, inner left, outer left
         switch (i) {
