@@ -69,6 +69,7 @@ class LineRobotBoard {
         InfraredSensor* ir_sensors[4];
         LIS3DH* lis3dh;
         Button* board_button;
+        Button* alt_board_button;
 
         std::function<bool(long)> onBoardPressedCallback;
         std::function<bool(long)> onBoardDoublePressedCallback;
@@ -237,6 +238,12 @@ class LineRobotBoard {
          */
         int getRawIRSensorValue(int sensor);
 
+        /**
+         * @brief Add an alternate pin to be used as a board button input in addition to the default board button pin (GPIO21)
+         * @param pin The pin to use as an alternate board button input
+         * @param activeLow Whether the button is active low (default: true)
+         */
+        void addAlternateBoardButtonPin(int pin, bool activeLow = true);
 
         /**
          * @brief Set the callback function to be called when the board button is pressed

@@ -499,6 +499,14 @@ void LineRobotBoard::onBoardButtonLongPressedHandler(long timePressed) {
     }
 }
 
+void LineRobotBoard::addAlternateBoardButtonPin(int pin, bool activeLow) {
+    // Setup the Button
+    this->alt_board_button = new Button(pin, 25, false, activeLow, 1000, 300);
+    this->alt_board_button->onPressed(std::bind(&LineRobotBoard::onBoardButtonPressedHandler, this, std::placeholders::_1));
+    this->alt_board_button->onDoublePressed(std::bind(&LineRobotBoard::onBoardButtonDoublePressedHandler, this, std::placeholders::_1));
+    this->alt_board_button->onLongPressed(std::bind(&LineRobotBoard::onBoardButtonLongPressedHandler, this, std::placeholders::_1));
+}
+
 void LineRobotBoard::onBoardButtonPressed(std::function<bool(long)> callback) {
     this->onBoardPressedCallback = callback;
 }
