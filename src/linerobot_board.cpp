@@ -81,6 +81,7 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger, St
     this->board_button->onPressed(std::bind(&LineRobotBoard::onBoardButtonPressedHandler, this, std::placeholders::_1));
     this->board_button->onDoublePressed(std::bind(&LineRobotBoard::onBoardButtonDoublePressedHandler, this, std::placeholders::_1));
     this->board_button->onLongPressed(std::bind(&LineRobotBoard::onBoardButtonLongPressedHandler, this, std::placeholders::_1));
+    this->alt_board_button = nullptr;
 }
 
 LineRobotBoard::~LineRobotBoard() {
@@ -310,6 +311,9 @@ void LineRobotBoard::tick2() {
     // Tick the Board Button
     // this->logger->print("Tick2: Ticking Board Button... ");
     this->board_button->tick();
+    if (this->alt_board_button != nullptr) {
+        this->alt_board_button->tick();
+    }
     
     // Process HTTP Connections
     if (this->server && this->tick2_count & 1 == 1) {  // Only process the HTTP server every 2nd tick, about 15.625Hz
