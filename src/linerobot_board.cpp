@@ -265,10 +265,10 @@ void LineRobotBoard::initInfraredSensors(int ir_threshold) {
         }
     }
 
-    this->ir_sensors[0] = new InfraredSensor(4, 6, 8, ir_threshold, baselines[0]);
-    this->ir_sensors[1] = new InfraredSensor(5, 3, 9, ir_threshold, baselines[1]);
-    this->ir_sensors[2] = new InfraredSensor(6, 4, 10, ir_threshold, baselines[2]);
-    this->ir_sensors[3] = new InfraredSensor(7, 7, 11, ir_threshold, baselines[3]);
+    this->ir_sensors[0] = new InfraredSensor(4, 3, 8, ir_threshold, baselines[0]);
+    this->ir_sensors[1] = new InfraredSensor(5, 6, 9, ir_threshold, baselines[1]);
+    this->ir_sensors[2] = new InfraredSensor(6, 7, 10, ir_threshold, baselines[2]);
+    this->ir_sensors[3] = new InfraredSensor(7, 4, 11, ir_threshold, baselines[3]);
     this->logger->println("IR Sensors Initialised with Baselines: " + String(baselines[0]) + ", " + String(baselines[1]) + ", " + String(baselines[2]) + ", " + String(baselines[3]));
 
     // Turn on the IR LEDs for each Sensor
