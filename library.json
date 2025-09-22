@@ -3,9 +3,9 @@
     "description": "The base module for the Hub Line Robot",
     "version": "0.1.0",
     "dependencies": {
-        "hub-robot-core": "git@github.com:demo-ninjas/hub-robot-core.git",
-        "hub-robot-http-utils": "git@github.com:demo-ninjas/hub-robot-http-utils.git",
-        "hub-robot-oled": "git@github.com:demo-ninjas/hub-robot-oled.git"
+        "hub-robot-core": "https://github.com/demo-ninjas/hub-robot-core.git",
+        "hub-robot-http-utils": "https://github.com/demo-ninjas/hub-robot-http-utils.git",
+        "hub-robot-oled": "https://github.com/demo-ninjas/hub-robot-oled.git"
     },
     "authors": [
         {
