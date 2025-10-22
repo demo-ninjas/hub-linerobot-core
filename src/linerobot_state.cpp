@@ -28,10 +28,9 @@ LineRobotState::LineRobotState() {
     this->ir_inner_left = 0;
     this->ir_inner_right = 0;
     this->ir_outer_right = 0;
-    this->ir_outer_left = 0;
+    this->ir_outer_left_triggered = false;
     this->ir_inner_left_triggered = false;
     this->ir_inner_right_triggered = false;
-    this->ir_outer_left_triggered = false;
     this->ir_outer_right_triggered = false;
     
 }
