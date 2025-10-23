@@ -413,18 +413,18 @@ void LineRobotBoard::cleanupTimersAndTasks() {
 
 void LineRobotBoard::pauseTimersAndTasks() {
     if (timers_running_) {
-        // timer_pause(TIMER_GROUP_0, TIMER_0);
-        // timer_pause(TIMER_GROUP_0, TIMER_1);
+        timer_pause(TIMER_GROUP_0, TIMER_0);
+        timer_pause(TIMER_GROUP_0, TIMER_1);
         vTaskSuspendAll();
-        // delay(64); // Give some time before moving on
+        delay(16); // Give some time before moving on
     }
 }
 
 void LineRobotBoard::resumeTimersAndTasks() {
     if (timers_running_) {
-        // timer_start(TIMER_GROUP_0, TIMER_0);
-        // timer_start(TIMER_GROUP_0, TIMER_1);
-        // delay(32); // Ensure timers have started before resuming
+        delay(16); // Ensure prior operations have settled
+        timer_start(TIMER_GROUP_0, TIMER_0);
+        timer_start(TIMER_GROUP_0, TIMER_1);
         xTaskResumeAll();
     }
 }
