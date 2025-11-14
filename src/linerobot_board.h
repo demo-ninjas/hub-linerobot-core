@@ -31,6 +31,7 @@
 #define BASELINE_SAMPLE_DURATION_MS 1000
 #define BASELINE_SAMPLE_DELAY_MS 10
 #define ADC_VOLTAGE_PIN 8   // ADC Pin attached to the voltage divider circuit
+#define SEGMENT_DISPLAY_CONNECTED false // Set to true if the segment display is connected
 
 class InfraredSensor {
 public:

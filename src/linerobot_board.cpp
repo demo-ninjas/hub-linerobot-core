@@ -96,9 +96,11 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     lis3dh_ = std::unique_ptr<LIS3DH>(new LIS3DH(I2C_MODE, 0x19));
 
     // Initialise the Segment Display
+#if SEGMENT_DISPLAY_CONNECTED
     voltage_display_ = std::unique_ptr<TM1637Display>(new TM1637Display(41, 42));  // CLK, DIO pins
     voltage_display_->setBrightness(0x08);  // Half Brightness
     voltage_display_->clear();
+#endif
 
     // Setup board button with proper binding
     board_button_ = std::unique_ptr<Button>(new Button(21, 25, false, true, 1000, 300));
@@ -655,10 +657,12 @@ void LineRobotBoard::tick2() {
     // Read Voltage Iput at ~1Hz (every 62nd tick)
     if (tick2_count_ % 62 == 0) {
         float voltage = getInputVoltageLevel();
+#if SEGMENT_DISPLAY_CONNECTED
         // Update the voltage display
         if (voltage_display_) {
             voltage_display_->showNumberDec(uint32_t(voltage), true, 6, 3);
         }
+#endif
 
         if (input_voltage_alert_threshold_ < 1.0) {
             input_voltage_alert_threshold_ += 0.1;
