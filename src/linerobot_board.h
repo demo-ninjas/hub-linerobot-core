@@ -19,6 +19,7 @@
 #include <array>
 #include <mutex>
 #include <atomic>
+#include <TM1637Display.h>
 
 // Constants
 #define INVALID_ANALOGUE_CHANNEL 65535
@@ -29,6 +30,7 @@
 #define DEFAULT_IR_THRESHOLD 400
 #define BASELINE_SAMPLE_DURATION_MS 1000
 #define BASELINE_SAMPLE_DELAY_MS 10
+#define ADC_VOLTAGE_PIN 8   // ADC Pin attached to the voltage divider circuit
 
 class InfraredSensor {
 public:
@@ -110,6 +112,8 @@ private:
     std::unique_ptr<LIS3DH> lis3dh_;
     std::unique_ptr<Button> board_button_;
     std::unique_ptr<Button> alt_board_button_;
+    std::unique_ptr<TM1637Display> voltage_display_;
+
     
     // Use array for better memory management
     std::array<std::unique_ptr<InfraredSensor>, NUM_IR_SENSORS> ir_sensors_;
@@ -129,6 +133,8 @@ private:
     int target_motor_speed_right_;
     uint16_t ramp_speed_diff_per_ms_left_;
     uint16_t ramp_speed_diff_per_ms_right_;
+    uint16_t last_voltage_adc_value_;
+    float input_voltage_alert_threshold_;
     
     // Atomic counters for thread safety
     std::atomic<unsigned long> tick1_count_{0};
@@ -161,38 +167,37 @@ private:
     bool initADC();
     bool initAccelerometer();
     bool initInfraredSensors(uint16_t ir_threshold);
-    bool initNVS();
-
+    
     // Task management
     bool setupTimersAndTasks();
     void cleanupTimersAndTasks();
     void pauseTimersAndTasks();
     void resumeTimersAndTasks();
-
+    
     // Core task functions
     void tick1();  // High-frequency sensor task (Core1, ~500Hz)
     void tick2();  // Lower-frequency misc tasks (Core0, ~31Hz)
-
+    
     // Sensor processing
     void tickInfraredSensors();
     void tickAccelerometer();
-
+    
     // Button event handlers
     void onBoardButtonPressedHandler(long time_pressed);
     void onBoardButtonDoublePressedHandler(long time_between_presses);
     void onBoardButtonLongPressedHandler(long time_pressed);
-
+    
     // Baseline management
     void preBaseline();
     bool performBaselineCapture(uint8_t sensor_index);
-
+    
     // Utility functions
     bool validateSensorIndex(uint8_t sensor) const;
     bool validateMotorSpeed(int16_t speed) const;
     bool validateLEDIndex(uint8_t led) const;
     void logDebug(const String& message) const;
     void logError(const String& message) const;
-
+    
     // Thread-safe motor control helpers
     bool setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t ramp_time_ms);
     void rampMotorSpeed(bool is_left, int16_t target_speed, int16_t current_speed, uint16_t ramp_speed_diff_per_ms);
@@ -202,6 +207,10 @@ private:
     bool loadConfiguration();
     bool saveBaselines();
     bool loadBaselines();
+    bool initNVS();
+    bool closeNVS();
+    
+    float voltageFromADCValue(uint16_t adc_value) const;
 public:
         /**
          * @brief Construct a new Line Robot Board object
@@ -529,6 +538,18 @@ public:
          */
         bool isWiFiConnected() const;
 
+        /**
+         * @brief Get the current input voltage level, which is read from the board's voltage divider circuit. This is useful for monitoring the battery level.
+         * @return Input voltage level in volts
+         * @note Returns 0 if voltage reading is not available
+         */
+        float getInputVoltageLevel();
+
+        /**
+         * @brief Set the voltage threshold for low voltage alerts
+         * @param threshold Voltage threshold in volts
+         */
+        void setInputVoltageAlertThreshold(float threshold);
 };
 
 #endif  // LINEROBOT_BOARD_H

@@ -5,7 +5,8 @@
     "dependencies": {
         "hub-robot-core": "https://github.com/demo-ninjas/hub-robot-core.git",
         "hub-robot-http-utils": "https://github.com/demo-ninjas/hub-robot-http-utils.git",
-        "hub-robot-oled": "https://github.com/demo-ninjas/hub-robot-oled.git"
+        "hub-robot-oled": "https://github.com/demo-ninjas/hub-robot-oled.git",
+        "smougenot/TM1637": "@ 0.0.0-alpha+sha.9486982048"
     },
     "authors": [
         {

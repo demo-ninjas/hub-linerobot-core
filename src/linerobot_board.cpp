@@ -18,6 +18,8 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     , eeprom_valid_(false)
     , core_task0_handle_(nullptr)
     , core_task1_handle_(nullptr)
+    , input_voltage_alert_threshold_(0.0)  // Default threshold set to 0 volts (special case for auto tuned threshold)
+    , last_voltage_adc_value_(0)
 {
     // Validate input parameters
     if (!state) {
@@ -43,14 +45,13 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     logDebug("Line Robot: Initialising...");
 
     // Initialise NVS (Non-Volatile Storage)
-    eeprom_valid_ = initNVS();
+    // eeprom_valid_ = initNVS();
+    // No longer doing this here - we'll do it on-demand in load/save configuration functions
 
     // Load Configuration from NVS
-    if (!loadConfiguration()) {
-        logError("Failed to load configuration from NVS - will run with defaults");
-    }
-    delay(10);  // Small delay to allow NVS operations to complete
-    esp_task_wdt_reset();   // Feed the watchdog
+    
+    // delay(10);  // Small delay to allow NVS operations to complete
+    // esp_task_wdt_reset();   // Feed the watchdog
 
     // Setup OLED Display first (for status display)
     oled_ = std::unique_ptr<HubOLED>(new HubOLED(oled_type));
@@ -74,19 +75,10 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
             }
             if (server_) {
                 esp_task_wdt_reset();   // Feed the watchdog before starting the HTTP server
-                // Start the HTTP server in a separate task to avoid blocking here
-                xTaskCreate(
-                    [](void* param) {
-                        HttpServer* server = static_cast<HttpServer*>(param);
-                        server->begin();
-                        vTaskDelete(nullptr); // Clean up the task after starting the server
-                    },
-                    "HttpServerBeginTask",    // Task name
-                    4096,                    // Stack size
-                    server_.get(),           // Parameter (HttpServer pointer)
-                    2,                       // Priority (low, since it's just starting the server)
-                    nullptr                  // No need to keep the handle
-                );
+                // Pause timers and tasks
+                pauseTimersAndTasks();
+                server_->begin();
+                resumeTimersAndTasks();
             }
         });
         wifi_man_->onDisconnected([this]() {
@@ -102,6 +94,11 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     motor_left_ = std::unique_ptr<DCMotor>(new DCMotor(12, 13, 14));
     motor_right_ = std::unique_ptr<DCMotor>(new DCMotor(38, 39, 40));
     lis3dh_ = std::unique_ptr<LIS3DH>(new LIS3DH(I2C_MODE, 0x19));
+
+    // Initialise the Segment Display
+    voltage_display_ = std::unique_ptr<TM1637Display>(new TM1637Display(41, 42));  // CLK, DIO pins
+    voltage_display_->setBrightness(0x08);  // Half Brightness
+    voltage_display_->clear();
 
     // Setup board button with proper binding
     board_button_ = std::unique_ptr<Button>(new Button(21, 25, false, true, 1000, 300));
@@ -135,11 +132,6 @@ LineRobotBoard::~LineRobotBoard() {
     // Clear all LEDs
     if (shift_register_) {
         shift_register_->clear();
-    }
-    
-    // Close NVS
-    if (eeprom_valid_) {
-        preferences_.end();
     }
     
     logDebug("Line Robot: Shutdown complete");
@@ -187,6 +179,11 @@ bool LineRobotBoard::begin(uint16_t ir_threshold) {
     logDebug("Shift Register Initialised");
 
     esp_task_wdt_reset();  // Feed watchdog after shift register init
+
+    if (!loadConfiguration()) {
+        logError("Failed to load configuration from NVS - will run with defaults");
+    }
+    esp_task_wdt_reset();  // Feed watchdog after NVS Config load
 
     if (!initMotors()) {
         logError("Failed to initialise motors");
@@ -326,12 +323,12 @@ bool LineRobotBoard::setupTimersAndTasks() {
                 }
             }
         },
-        "CoreTask1",     // Task name
-        8192,            // Stack size
-        this,            // Parameter
-        3,               // Priority (medium)
-        &core_task1_handle_,  // Task handle
-        0                // Core 0
+        "CoreTask1",            // Task name
+        12288,                  // Stack size
+        this,                   // Parameter
+        3,                      // Priority (medium)
+        &core_task1_handle_,    // Task handle
+        0                       // Core 0
     );
     
     if (result != pdPASS) {
@@ -415,7 +412,6 @@ void LineRobotBoard::pauseTimersAndTasks() {
     if (timers_running_) {
         timer_pause(TIMER_GROUP_0, TIMER_0);
         timer_pause(TIMER_GROUP_0, TIMER_1);
-        vTaskSuspendAll();
         delay(16); // Give some time before moving on
     }
 }
@@ -425,7 +421,6 @@ void LineRobotBoard::resumeTimersAndTasks() {
         delay(16); // Ensure prior operations have settled
         timer_start(TIMER_GROUP_0, TIMER_0);
         timer_start(TIMER_GROUP_0, TIMER_1);
-        xTaskResumeAll();
     }
 }
 
@@ -438,6 +433,15 @@ bool LineRobotBoard::initNVS() {
         logError("Failed to initialise NVS");
     }
     return success;
+}
+
+bool LineRobotBoard::closeNVS() {
+    if (eeprom_valid_) {
+        preferences_.end();
+        logDebug("NVS closed successfully");
+        return true;
+    }
+    return false;
 }
 
 bool LineRobotBoard::initAccelerometer() {
@@ -645,6 +649,37 @@ void LineRobotBoard::tick2() {
             }
         } else {
             logError("Low stack in HTTP processing: " + String(stackWaterMark));
+        }
+    }
+
+    // Read Voltage Iput at ~1Hz (every 62nd tick)
+    if (tick2_count_ % 62 == 0) {
+        float voltage = getInputVoltageLevel();
+        // Update the voltage display
+        if (voltage_display_) {
+            voltage_display_->showNumberDec(uint32_t(voltage), true, 6, 3);
+        }
+
+        if (input_voltage_alert_threshold_ < 1.0) {
+            input_voltage_alert_threshold_ += 0.1;
+            if (input_voltage_alert_threshold_ > 0.6) {
+                input_voltage_alert_threshold_ = voltage - 0.9; // Set threshold to 0.9V below current voltage 
+                logDebug("Auto-tuned input voltage alert threshold set to: " + String(input_voltage_alert_threshold_) + "v");
+            }
+        }
+        
+        if (voltage < input_voltage_alert_threshold_) {
+            // Turn on the board LED to indicate low voltage (GPIO2)
+            pinMode(2, OUTPUT);
+            if (digitalRead(2) != HIGH) {
+                digitalWrite(2, HIGH);
+                logError("Input voltage low: " + String(voltage) + "v");
+            } else {
+                digitalWrite(2, LOW);
+            }
+        } else {
+            // Turn off the board LED if voltage is above threshold
+            digitalWrite(2, LOW);
         }
     }
 
@@ -1528,7 +1563,8 @@ String LineRobotBoard::performDiagnostic() const {
     report += "   Right Motor: " + String(motor_right_ ? "OK" : "FAILED") + "\n";
     report += " Accelerometer: " + String(lis3dh_ ? "OK" : "FAILED") + "\n";
     report += "  Board Button: " + String(board_button_ ? "OK" : "FAILED") + "\n";
-    report += "    Alt Button: " + String(alt_board_button_ ? "OK" : "NOT CONFIGURED") + "\n\n";
+    report += "    Alt Button: " + String(alt_board_button_ ? "OK" : "NOT CONFIGURED") + "\n";
+    report += " Input Voltage: " + String(voltageFromADCValue(last_voltage_adc_value_), 2) + "v\n\n";
     
     // Network Status
     report += "--- Network Status ---\n";
@@ -1572,6 +1608,7 @@ String LineRobotBoard::getSystemStatus() const {
     status += "  \"uptime\": " + String(getUptime()) + ",\n";
     status += "  \"initialised\": " + String(is_initialised_ ? "true" : "false") + ",\n";
     status += "  \"debug\": " + String(debug_ ? "true" : "false") + ",\n";
+    status += "  \"input_voltage\": " + String(voltageFromADCValue(last_voltage_adc_value_), 2) + ",\n";
     status += "  \"wifi_connected\": " + String(isWiFiConnected() ? "true" : "false") + ",\n";
     status += "  \"core_ticks\": " + String(getCoreTasksTickCount()) + ",\n";
     status += "  \"other_ticks\": " + String(getOtherTasksTickCount()) + ",\n";
@@ -1599,11 +1636,7 @@ bool LineRobotBoard::resetIRBaselines() {
 }
 
 bool LineRobotBoard::loadConfiguration() {
-    if (!eeprom_valid_) {
-        logError("Cannot load configuration - NVS not available");
-        return false;
-    }
-    
+    delay(10);  // Small delay to ensure system stability before loading
     bool success = loadBaselines();
     // We might add some more configs here in the future - for now, just loading the baselines
     
@@ -1664,12 +1697,14 @@ String LineRobotBoard::getConfigKey(const String& key) const {
     return "lr_" + key;  // Prefix to avoid conflicts
 }
 
-bool LineRobotBoard::saveBaselines() {
-    if (!eeprom_valid_) return false;
-    
+bool LineRobotBoard::saveBaselines() {    
     std::lock_guard<std::mutex> lock(sensor_mutex_);
-    
     pauseTimersAndTasks();
+    if (!initNVS()) {
+        resumeTimersAndTasks();
+        return false;
+    }
+
     bool success = true;
     for (uint8_t i = 0; i < NUM_IR_SENSORS; i++) {
         if (ir_sensors_[i]) {
@@ -1682,24 +1717,27 @@ bool LineRobotBoard::saveBaselines() {
             }
         }
     }
+
+    closeNVS();
     
     resumeTimersAndTasks();
     return success;
 }
 
 bool LineRobotBoard::loadBaselines() {
-    if (!eeprom_valid_) {
-        logError("Cannot load baselines - NVS not available - using default baseline of 0");
-        for (uint8_t i = 0; i < NUM_IR_SENSORS; i++) {
-            config_.ir_baselines[i] = 0;
-        }
-        return false;
-    }
-    
     std::lock_guard<std::mutex> lock(sensor_mutex_);
     
     // Pause timers and tasks to ensure safe loading
     pauseTimersAndTasks();
+
+    if (!initNVS()) {
+        logError("Cannot load baselines - NVS not available - using default baseline of 0");
+        for (uint8_t i = 0; i < NUM_IR_SENSORS; i++) {
+            config_.ir_baselines[i] = 0;
+        }
+        resumeTimersAndTasks();
+        return false;
+    }
 
     bool success = true;
     for (uint8_t i = 0; i < NUM_IR_SENSORS; i++) {
@@ -1717,10 +1755,41 @@ bool LineRobotBoard::loadBaselines() {
         }
     }
 
+    closeNVS();
+
     // Resume timers and tasks
     resumeTimersAndTasks();
     
     return success;
+}
+
+
+float LineRobotBoard::getInputVoltageLevel() {
+    // Read voltage from ADC pin
+    uint16_t adc_value = analogRead(ADC_VOLTAGE_PIN);
+
+    // Apply exponential smoothing to reduce noise
+    const float smoothing_factor = 0.3f;
+    if (last_voltage_adc_value_ == 0) {
+        // First reading, no smoothing needed
+        last_voltage_adc_value_ = adc_value;
+    } else {
+        // Apply smoothing: new_value = alpha * current + (1-alpha) * previous
+        last_voltage_adc_value_ = static_cast<uint16_t>(
+            smoothing_factor * adc_value + (1.0f - smoothing_factor) * last_voltage_adc_value_
+        );
+    }
+    adc_value = last_voltage_adc_value_;
+    return voltageFromADCValue(adc_value);
+}
+
+float LineRobotBoard::voltageFromADCValue(uint16_t adc_value) const {
+    // Convert ADC value to voltage level (assuming 3.3V reference and voltage divider)
+    static const float r1 = 75000.0; // Resistor R1 value in ohms
+    static const float r2 = 10000.0; // Resistor R2 value in ohms
+    static const float divider_ratio = (r1 + r2) / r2;  // Inverted voltage divider ratio to get actual voltage
+    float voltage = (adc_value / 4095.0) * 3.3 * divider_ratio;
+    return voltage;
 }
 
 
