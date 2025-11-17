@@ -5,6 +5,7 @@
 #include <cmath>
 #include <algorithm>
 #include <esp_task_wdt.h>
+#include "esp_wifi.h"
 
 LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger, 
                               const String& wifi_ssid, const String& wifi_password, 
@@ -47,8 +48,6 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     // Initialise NVS (Non-Volatile Storage)
     // eeprom_valid_ = initNVS();
     // No longer doing this here - we'll do it on-demand in load/save configuration functions
-
-    // Load Configuration from NVS
     
     // delay(10);  // Small delay to allow NVS operations to complete
     // esp_task_wdt_reset();   // Feed the watchdog
@@ -66,6 +65,11 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
         server_->setPort(80);
         addDefaultRoutes();
         
+        // Setup HTTP Client
+        client_ = std::unique_ptr<HubHttpClient>(new HubHttpClient());
+        client_->setTimeout(20000);  // 20 second timeout for requests
+        client_->setUserAgent("HubLineRobot/" BOARD_VERSION);
+
         // Setup WiFi Manager
         wifi_man_ = std::unique_ptr<WifiManager>(new WifiManager(wifi_ssid, wifi_password));
         wifi_man_->onConnected([this](String ip) {
@@ -74,11 +78,9 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
                 oled_->setLine(1, ip, true);
             }
             if (server_) {
-                esp_task_wdt_reset();   // Feed the watchdog before starting the HTTP server
-                // Pause timers and tasks
-                pauseTimersAndTasks();
+                logDebug("Starting HTTP server...");
                 server_->begin();
-                resumeTimersAndTasks();
+                logDebug("HTTP server started");
             }
         });
         wifi_man_->onDisconnected([this]() {
@@ -149,6 +151,7 @@ bool LineRobotBoard::begin(uint16_t ir_threshold) {
     
     logDebug("Line Robot Board: Starting initialization...");
     
+    delay(100); // Just hang 10 for a bit, we're going to be accessing the NVS shortly and that can be slow and trigger issues with the cached memory'
     // Feed the watchdog to prevent timeout during initialization
     esp_task_wdt_reset();
 
@@ -159,16 +162,6 @@ bool LineRobotBoard::begin(uint16_t ir_threshold) {
     logDebug("OLED Initialised");
     
     // Feed watchdog after OLED init
-    esp_task_wdt_reset();
-
-    // Finally, Initialise WiFi if configured
-    if (wifi_man_) {
-        logDebug("Initialising WiFi Manager...");
-        oled_->setLine(1, "WiFi starting...", true);
-        wifi_man_->begin();
-    }
-
-    // Feed watchdog after WiFi init
     esp_task_wdt_reset();
 
     // Initialise hardware components
@@ -228,6 +221,15 @@ bool LineRobotBoard::begin(uint16_t ir_threshold) {
     oled_->setLine(1, "Ready!", true);
     oled_->setLine(3, "", true);  // Clear status line
 
+
+    // Finally, Initialise WiFi if configured
+    if (wifi_man_) {
+        wifi_man_->begin();
+    }
+
+    // Feed watchdog after WiFi init
+    esp_task_wdt_reset();
+
     logDebug("Line Robot Board: Initialisation Complete");
     delay(8); // Brief delay to allow everything to settle (and also allow the user to albeit briefly see the "Ready!" message on the OLED)
     return true;
@@ -256,122 +258,61 @@ bool LineRobotBoard::setupTimersAndTasks() {
     // Feed the watchdog to prevent timeout during initialization
     esp_task_wdt_reset();
     
-    // Configure timer settings
-    timer_config_t timer_config = {
-        .alarm_en = TIMER_ALARM_EN,
-        .counter_en = TIMER_PAUSE,  // Start paused
-        .intr_type = TIMER_INTR_LEVEL,
-        .counter_dir = TIMER_COUNT_UP,
-        .auto_reload = TIMER_AUTORELOAD_EN,
-        .divider = 80,  // 80MHz / 80 = 1MHz timer resolution
+    // Create esp_timer configuration for high-frequency timer (2kHz, 500us)
+    esp_timer_create_args_t timer0_args = {
+        .callback = [](void* arg) {
+            LineRobotBoard* board = static_cast<LineRobotBoard*>(arg);
+            board->tick1();
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,  // Run in timer task context, not ISR
+        .name = "CoreTimer0",
+        .skip_unhandled_events = true  // Skip if previous callback is still running
     };
-    
-    // Initialise Timer0 for high-frequency task (2kHz, 500us)
-    esp_task_wdt_reset();  // Feed watchdog before timer setup
-    if (timer_init(TIMER_GROUP_0, TIMER_0, &timer_config) != ESP_OK) {
-        logError("Failed to initialise Timer0");
-        return false;
-    }
-    timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0);
-    timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, 500); // 500us in microseconds
-    
-    // Initialise Timer1 for low-frequency task (62.5Hz, 16ms)
-    esp_task_wdt_reset();  // Feed watchdog before timer setup
-    if (timer_init(TIMER_GROUP_0, TIMER_1, &timer_config) != ESP_OK) {
-        logError("Failed to initialise Timer1");
-        return false;
-    }
-    timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-    timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, 16000); // 16ms in microseconds
 
-    // Feed watchdog before task creation (memory allocation can be slow)
-    esp_task_wdt_reset();
+    esp_timer_handle_t core_timer0_handle = nullptr;
+    esp_err_t err = esp_timer_create(&timer0_args, &core_timer0_handle);
+    if (err != ESP_OK) {
+        logError("Failed to create CoreTimer0: " + String(esp_err_to_name(err)));
+        return false;
+    }
     
-    // Create high-priority task for sensor processing (Core 1)
-    BaseType_t result = xTaskCreatePinnedToCore(
-        [](void* param) {
-            LineRobotBoard* board = static_cast<LineRobotBoard*>(param);
-            while (true) {
-                // Wait for timer notification with timeout for safety
-                if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10)) > 0) {
-                    board->tick1();
-                }
-            }
+    // Store timer handles (you'll need to add these as member variables)
+    core_task0_handle_ = core_timer0_handle;
+    // Start the timer
+    err = esp_timer_start_periodic(core_task0_handle_, 500);  // 500 microseconds
+    if (err != ESP_OK) {
+        logError("Failed to start CoreTimer0: " + String(esp_err_to_name(err)));
+        return false;
+    }
+
+
+    // Create esp_timer configuration for low-frequency timer (62.5Hz, 16ms)
+    esp_timer_create_args_t timer1_args = {
+        .callback = [](void* arg) {
+            LineRobotBoard* board = static_cast<LineRobotBoard*>(arg);
+            board->tick2();
         },
-        "CoreTask0",     // Task name
-        8192,            // Stack size
-        this,            // Parameter
-        6,               // Priority (high)
-        &core_task0_handle_,  // Task handle
-        1                // Core 1
-    );
-    
-    if (result != pdPASS) {
-        logError("Failed to create CoreTask0");
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,  // Run in timer task context, not ISR
+        .name = "CoreTimer1",
+        .skip_unhandled_events = true  // Skip if previous callback is still running
+    };
+
+    esp_timer_handle_t core_timer1_handle = nullptr;
+    err = esp_timer_create(&timer1_args, &core_timer1_handle);
+    if (err != ESP_OK) {
+        logError("Failed to create CoreTimer1: " + String(esp_err_to_name(err)));
         return false;
     }
+    
+    core_task1_handle_ = core_timer1_handle;
 
-    // Feed watchdog before second task creation
-    esp_task_wdt_reset();
-    
-    // Create lower-priority task for misc operations (Core 0)
-    result = xTaskCreatePinnedToCore(
-        [](void* param) {
-            LineRobotBoard* board = static_cast<LineRobotBoard*>(param);
-            while (true) {
-                // Wait for timer notification with timeout for safety
-                if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50)) > 0) {
-                    board->tick2();
-                }
-            }
-        },
-        "CoreTask1",            // Task name
-        12288,                  // Stack size
-        this,                   // Parameter
-        3,                      // Priority (medium)
-        &core_task1_handle_,    // Task handle
-        0                       // Core 0
-    );
-    
-    if (result != pdPASS) {
-        logError("Failed to create CoreTask1");
-        vTaskDelete(core_task0_handle_);
-        core_task0_handle_ = nullptr;
+    err = esp_timer_start_periodic(core_task1_handle_, 16000);  // 16000 microseconds (16ms)
+    if (err != ESP_OK) {
+        logError("Failed to start CoreTimer1: " + String(esp_err_to_name(err)));
         return false;
     }
-
-    // Feed watchdog before ISR setup
-    esp_task_wdt_reset();
-    
-    // Set up timer ISR callbacks
-    timer_isr_callback_add(TIMER_GROUP_0, TIMER_0, [](void* arg) -> bool {
-        LineRobotBoard* board = static_cast<LineRobotBoard*>(arg);
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        if (board->core_task0_handle_) {
-            vTaskNotifyGiveFromISR(board->core_task0_handle_, &xHigherPriorityTaskWoken);
-        }
-        return xHigherPriorityTaskWoken == pdTRUE;
-    }, this, ESP_INTR_FLAG_IRAM);
-
-    timer_isr_callback_add(TIMER_GROUP_0, TIMER_1, [](void* arg) -> bool {
-        LineRobotBoard* board = static_cast<LineRobotBoard*>(arg);
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        if (board->core_task1_handle_) {
-            vTaskNotifyGiveFromISR(board->core_task1_handle_, &xHigherPriorityTaskWoken);
-        }
-        return xHigherPriorityTaskWoken == pdTRUE;
-    }, this, ESP_INTR_FLAG_IRAM);
-
-    // Feed watchdog before enabling interrupts
-    esp_task_wdt_reset();
-    
-    // Enable timer interrupts
-    timer_enable_intr(TIMER_GROUP_0, TIMER_0);
-    timer_enable_intr(TIMER_GROUP_0, TIMER_1);
-
-    // Start timers
-    timer_start(TIMER_GROUP_0, TIMER_0);
-    timer_start(TIMER_GROUP_0, TIMER_1);
     
     // Final watchdog feed for the tasks setup
     esp_task_wdt_reset();
@@ -389,22 +330,10 @@ void LineRobotBoard::cleanupTimersAndTasks() {
     logDebug("Cleaning up timers and tasks...");
     
     // Stop and deinitialise timers
-    timer_pause(TIMER_GROUP_0, TIMER_0);
-    timer_pause(TIMER_GROUP_0, TIMER_1);
-    timer_disable_intr(TIMER_GROUP_0, TIMER_0);
-    timer_disable_intr(TIMER_GROUP_0, TIMER_1);
-    timer_deinit(TIMER_GROUP_0, TIMER_0);
-    timer_deinit(TIMER_GROUP_0, TIMER_1);
-    
-    // Delete tasks
-    if (core_task0_handle_) {
-        vTaskDelete(core_task0_handle_);
-        core_task0_handle_ = nullptr;
-    }
-    if (core_task1_handle_) {
-        vTaskDelete(core_task1_handle_);
-        core_task1_handle_ = nullptr;
-    }
+    esp_timer_stop(core_task0_handle_);
+    esp_timer_stop(core_task1_handle_);
+    esp_timer_delete(core_task0_handle_);
+    esp_timer_delete(core_task1_handle_);
     
     timers_running_ = false;
     logDebug("Timers and tasks cleaned up");
@@ -412,27 +341,27 @@ void LineRobotBoard::cleanupTimersAndTasks() {
 
 void LineRobotBoard::pauseTimersAndTasks() {
     if (timers_running_) {
-        timer_pause(TIMER_GROUP_0, TIMER_0);
-        timer_pause(TIMER_GROUP_0, TIMER_1);
-        delay(16); // Give some time before moving on
+        esp_timer_stop(core_task0_handle_);
+        esp_timer_stop(core_task1_handle_);
     }
 }
 
 void LineRobotBoard::resumeTimersAndTasks() {
     if (timers_running_) {
-        delay(16); // Ensure prior operations have settled
-        timer_start(TIMER_GROUP_0, TIMER_0);
-        timer_start(TIMER_GROUP_0, TIMER_1);
+        esp_timer_start_periodic(core_task0_handle_, 500);
+        esp_timer_start_periodic(core_task1_handle_, 16000);        
     }
 }
 
-bool LineRobotBoard::initNVS() {
-    bool success = preferences_.begin("hubrobot", false);
+bool LineRobotBoard::initNVS(bool read_only) {
+    bool success = preferences_.begin("hbot", false);
     if (success) {
         logDebug("NVS initialised successfully");
+        eeprom_valid_ = true;
         delay(32); // Brief delay to allow NVS to stabilise
     } else {
         logError("Failed to initialise NVS");
+        eeprom_valid_ = false;
     }
     return success;
 }
@@ -443,6 +372,7 @@ bool LineRobotBoard::closeNVS() {
         logDebug("NVS closed successfully");
         return true;
     }
+    logError("NVS was not valid, cannot close");
     return false;
 }
 
@@ -581,8 +511,17 @@ bool LineRobotBoard::initInfraredSensors(uint16_t ir_threshold) {
 void LineRobotBoard::tick1() {
     tick1_count_++;
 
+    // Get the core ID for logging purposes
+    int core_id = xPortGetCoreID();
+    static unsigned long last_tick_time = micros();
+    static unsigned long tick_interval_sum = 0;
+    static unsigned long tick_interval_count = 0;
+    static unsigned long tick_duration_sum = 0;
+    static unsigned long last_log_time = 0;
+
+    unsigned long start_time = micros();
+
     // High-frequency sensor processing (2kHz)
-    // This task runs on Core1 for dedicated sensor processing
 
     // Process IR sensors at 1kHz (every tick)
     if (tick1_count_ % 2 == 0) {
@@ -617,11 +556,28 @@ void LineRobotBoard::tick1() {
 
         // Check stack watermark for CoreTask0
         if (core_task0_handle_) {
-            UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(core_task0_handle_);
+            UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(nullptr);
             if (stackWaterMark < 256) {
                 logError("WARNING: Core 1 (Priority tasks) has had a LOW stack availablility: " + String(stackWaterMark));
             }
         }
+    }
+
+    unsigned long end_time = micros();
+    tick_interval_sum += start_time - last_tick_time;
+    tick_duration_sum += end_time - start_time;
+    tick_interval_count++;
+    last_tick_time = start_time;
+    if (millis() - last_log_time >= 1000) {  // Log every 1000ms (1 second)
+        unsigned long tick_interval = tick_interval_sum / tick_interval_count;
+        avg_tick1_interval_us_ = tick_interval;
+        avg_tick1_duration_us_ = tick_duration_sum / tick_interval_count;
+
+        tick_interval_sum = 0;
+        tick_interval_count = 0;
+        tick_duration_sum = 0;
+        last_log_time = millis();
+        // logDebug("Tick1 Avg: " + String(tick_interval) + "us (Core " + String(core_id) + ")");
     }
 }
 
@@ -629,7 +585,17 @@ void LineRobotBoard::tick2() {
     tick2_count_++;
 
     // Lower-frequency miscellaneous tasks (62.5Hz)
-    // This task runs on Core0 and shares resources with WiFi/system tasks
+
+        // Get the core ID for logging purposes
+    int core_id = xPortGetCoreID();
+    static unsigned long last_log_time = 0;
+    static unsigned long last_tick_time = micros();
+    static unsigned long tick_interval_sum = 0;
+    static unsigned long tick_duration_sum = 0;
+    static unsigned long tick_interval_count = 0;
+
+    unsigned long start_time = micros();
+
 
     // Process board button every tick
     if (board_button_) {
@@ -642,16 +608,18 @@ void LineRobotBoard::tick2() {
     // Process HTTP connections at ~32Hz (every 2nd tick) with error protection
     if (server_ && (tick2_count_ % 2 == 0)) {
         // Check available stack space before processing HTTP
-        UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(nullptr);
-        if (stackWaterMark > 512) { // Only process if we have sufficient stack
+        // UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(nullptr);
+        // if (stackWaterMark > 512) { // Only process if we have sufficient stack
             try {
-                server_->tick();
+                if (server_->isRunning()) {
+                    server_->tick();
+                }
             } catch (...) {
                 logError("HTTP server tick exception caught");
             }
-        } else {
-            logError("Low stack in HTTP processing: " + String(stackWaterMark));
-        }
+        // } else {
+            // logError("Low stack in HTTP processing: " + String(stackWaterMark));
+        // }
     }
 
     // Read Voltage Iput at ~1Hz (every 62nd tick)
@@ -692,11 +660,27 @@ void LineRobotBoard::tick2() {
         tick2_count_ = 0;
         // Check stack watermark for CoreTask1
         if (core_task1_handle_) {
-            UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(core_task1_handle_);
+            UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(nullptr);
             if (stackWaterMark < 256) {
                 logError("WARNING: Core 0 (Other Tasks) has had a LOW stack availablility: " + String(stackWaterMark));
             }
         }
+    }
+
+    unsigned long end_time = micros();
+    tick_interval_sum += start_time - last_tick_time;
+    tick_duration_sum += end_time - start_time;
+    tick_interval_count++;
+    last_tick_time = micros();
+    if (millis() - last_log_time >= 10000) {  // Log every 10000ms (10 seconds)
+        last_log_time = millis();
+        unsigned long tick_interval = tick_interval_sum / tick_interval_count;
+        avg_tick2_interval_us_ = tick_interval;
+        avg_tick2_duration_us_ = tick_duration_sum / tick_interval_count;
+        tick_duration_sum = 0;
+        tick_interval_sum = 0;
+        tick_interval_count = 0;
+        // logDebug("Tick2 Avg: " + String(tick_interval) + "us (Core " + String(core_id) + ")");
     }
 }
 
@@ -1141,7 +1125,7 @@ void LineRobotBoard::addDefaultRoutes() {
     if (!server_) return;
 
     server_->on("/", [](HttpRequest& req) {
-        HttpResponse response;
+        HubHttpResponse response;
         response.status = 200;
         response.body = "<!DOCTYPE html><html><head><title>Innovation Hub - Line Robot v" BOARD_VERSION "</title></head>"
                        "<body><h1>Line Robot Control Interface</h1>"
@@ -1179,7 +1163,7 @@ void LineRobotBoard::addDefaultRoutes() {
             }
         }
     
-        HttpResponse resp;
+        HubHttpResponse resp;
         resp.status = 200;
         resp.body = response_str.length() > 0 ? response_str : "No LEDs specified";
         resp.headers["Content-Type"] = "text/plain";
@@ -1221,7 +1205,7 @@ void LineRobotBoard::addDefaultRoutes() {
             response_str += "Emergency Stop Activated\n";
         }
     
-        HttpResponse resp;
+        HubHttpResponse resp;
         resp.status = 200;
         resp.body = response_str.length() > 0 ? response_str : "No motor commands specified";
         resp.headers["Content-Type"] = "text/plain";
@@ -1229,7 +1213,7 @@ void LineRobotBoard::addDefaultRoutes() {
     });
 
     server_->on("/adc", [this](HttpRequest& req) {
-        HttpResponse resp;
+        HubHttpResponse resp;
         resp.status = 200;
         
         // Avoid large string concatenations - build response incrementally
@@ -1268,7 +1252,7 @@ void LineRobotBoard::addDefaultRoutes() {
     });
 
     server_->on("/ir", [this](HttpRequest& req) {
-        HttpResponse resp;
+        HubHttpResponse resp;
         resp.status = 200;
         
         uint8_t sensor_mask = getIRSensorMask();
@@ -1306,7 +1290,7 @@ void LineRobotBoard::addDefaultRoutes() {
 
     server_->on("/pose", [this](HttpRequest& req) {
         if (!state_) {
-            HttpResponse resp;
+            HubHttpResponse resp;
             resp.status = 500;
             resp.body = "State not available";
             resp.headers["Content-Type"] = "text/plain";
@@ -1323,7 +1307,7 @@ void LineRobotBoard::addDefaultRoutes() {
             response_str += "  \"last_update\": " + String(state_->pose.last_update_time) + "\n";
             response_str += "}";
             
-            HttpResponse resp;
+            HubHttpResponse resp;
             resp.status = 200;
             resp.body = response_str;
             resp.headers["Content-Type"] = "application/json";
@@ -1337,7 +1321,7 @@ void LineRobotBoard::addDefaultRoutes() {
             response_str += "  Heading: " + String(state_->pose.heading, 3) + " rad\n";
             response_str += "  Last Update: " + String(state_->pose.last_update_time) + " ms\n";
         
-            HttpResponse resp;
+            HubHttpResponse resp;
             resp.status = 200;
             resp.body = response_str;
             resp.headers["Content-Type"] = "text/plain";
@@ -1347,7 +1331,7 @@ void LineRobotBoard::addDefaultRoutes() {
 
     // Add new status and diagnostic routes
     server_->on("/status", [this](HttpRequest& req) {
-        HttpResponse resp;
+        HubHttpResponse resp;
         resp.status = 200;
         resp.body = getSystemStatus();
         resp.headers["Content-Type"] = "application/json";
@@ -1355,7 +1339,7 @@ void LineRobotBoard::addDefaultRoutes() {
     });
 
     server_->on("/diagnostic", [this](HttpRequest& req) {
-        HttpResponse resp;
+        HubHttpResponse resp;
         resp.status = 200;
         resp.body = performDiagnostic();
         resp.headers["Content-Type"] = "text/plain";
@@ -1364,7 +1348,7 @@ void LineRobotBoard::addDefaultRoutes() {
     
     // Simple health check endpoint
     server_->on("/health", [this](HttpRequest& req) {
-        HttpResponse resp;
+        HubHttpResponse resp;
         resp.status = 200;
         resp.body = "OK";
         resp.headers["Content-Type"] = "text/plain";
@@ -1373,17 +1357,14 @@ void LineRobotBoard::addDefaultRoutes() {
     
     // Stack monitoring endpoint
     server_->on("/debug", [this](HttpRequest& req) {
-        HttpResponse resp;
+        HubHttpResponse resp;
         resp.status = 200;
         
-        UBaseType_t task0Stack = uxTaskGetStackHighWaterMark(core_task0_handle_);
-        UBaseType_t task1Stack = uxTaskGetStackHighWaterMark(core_task1_handle_);
+        UBaseType_t task0Stack = uxTaskGetStackHighWaterMark(nullptr);
         size_t freeHeap = ESP.getFreeHeap();
         size_t minFreeHeap = ESP.getMinFreeHeap();
-        
 
-        resp.body = "Core 1 Min Free Stack:" + String(task1Stack) + " (priority tasks on this core)" 
-                 + "\nCore 0 Min Free Stack:" + String(task0Stack) + " (other tasks on this core)" +
+        resp.body = "Tasks Min Free Stack:" + String(task0Stack) +
                    "\n            Free Heap:" + String(freeHeap) + 
                    "\n             Min Heap:" + String(minFreeHeap) +
                    "\n      Time since boot:" + String(getUptime()) + " ms";
@@ -1392,7 +1373,7 @@ void LineRobotBoard::addDefaultRoutes() {
     });
 
     server_->on("/baseline", [this](HttpRequest& req) {
-        HttpResponse resp;
+        HubHttpResponse resp;
         resp.status = 200;
         
         if (req.query.find("action") != req.query.end()) {
@@ -1616,6 +1597,10 @@ String LineRobotBoard::getSystemStatus() const {
     status += "  \"wifi_connected\": " + String(isWiFiConnected() ? "true" : "false") + ",\n";
     status += "  \"core_ticks\": " + String(getCoreTasksTickCount()) + ",\n";
     status += "  \"other_ticks\": " + String(getOtherTasksTickCount()) + ",\n";
+    status += "  \"avg_tick1_interval_us\": " + String(avg_tick1_interval_us_) + ",\n";
+    status += "  \"avg_tick2_interval_us\": " + String(avg_tick2_interval_us_) + ",\n";
+    status += "  \"avg_tick1_duration_us\": " + String(avg_tick1_duration_us_) + ",\n";
+    status += "  \"avg_tick2_duration_us\": " + String(avg_tick2_duration_us_) + ",\n";
     status += "  \"ir_mask\": " + String(getIRSensorMask()) + ",\n";
     status += "  \"motor_left\": " + String(getMotorSpeedLeft()) + ",\n";
     status += "  \"motor_right\": " + String(getMotorSpeedRight()) + "\n";
@@ -1680,14 +1665,14 @@ void LineRobotBoard::setAutoBaseline(bool enable) {
 }
 
 // HTTP Route Management
-bool LineRobotBoard::addHttpRoute(const String& route, std::function<void(HttpRequest*, HttpResponse*, LineRobotBoard*)> handler) {
+bool LineRobotBoard::addHttpRoute(const String& route, std::function<void(HttpRequest*, HubHttpResponse*, LineRobotBoard*)> handler) {
     if (!server_) {
         logError("HTTP server not available");
         return false;
     }
     
     server_->on(route, [handler, this](HttpRequest& req) {
-        HttpResponse response;
+        HubHttpResponse response;
         handler(&req, &response, this);
         return response;
     });
@@ -1704,7 +1689,7 @@ String LineRobotBoard::getConfigKey(const String& key) const {
 bool LineRobotBoard::saveBaselines() {    
     std::lock_guard<std::mutex> lock(sensor_mutex_);
     pauseTimersAndTasks();
-    if (!initNVS()) {
+    if (!initNVS(false)) {
         resumeTimersAndTasks();
         return false;
     }
@@ -1734,7 +1719,7 @@ bool LineRobotBoard::loadBaselines() {
     // Pause timers and tasks to ensure safe loading
     pauseTimersAndTasks();
 
-    if (!initNVS()) {
+    if (!initNVS(true)) {
         logError("Cannot load baselines - NVS not available - using default baseline of 0");
         for (uint8_t i = 0; i < NUM_IR_SENSORS; i++) {
             config_.ir_baselines[i] = 0;
@@ -1747,6 +1732,7 @@ bool LineRobotBoard::loadBaselines() {
     for (uint8_t i = 0; i < NUM_IR_SENSORS; i++) {
         String key = "ir_" + String(i);
         int16_t baseline = preferences_.getInt(key.c_str(), 0);
+        vTaskDelay(5);  // Small delay to avoid NVS issues
         
         // Validate baseline range
         if (baseline >= -MAX_ANALOG_VALUE && baseline <= MAX_ANALOG_VALUE) {
@@ -1796,6 +1782,9 @@ float LineRobotBoard::voltageFromADCValue(uint16_t adc_value) const {
     return voltage;
 }
 
+HubHttpClient* LineRobotBoard::getHttpClient() {
+    return client_.get();
+}
 
 // InfraredSensor Implementation
 InfraredSensor::InfraredSensor(uint8_t analog_pin, uint8_t indicator_led_num, 

@@ -1,7 +1,7 @@
 #ifndef LINEROBOT_BOARD_H
 #define LINEROBOT_BOARD_H
 
-#define BOARD_VERSION "2.2"
+#define BOARD_VERSION "2.3"
 #define BOARD_TYPE "Hub Line Robot Board"
 
 #include <Arduino.h>
@@ -9,6 +9,7 @@
 #include "linerobot_state.h"
 #include <wifi_manager.h>
 #include <http_server.h>
+#include <http_client.h>
 #include <hub_oled.h>
 #include <serial_proxy.hpp>
 #include <shift_register.h>
@@ -106,6 +107,7 @@ private:
     // Smart pointers for automatic memory management
     std::unique_ptr<WifiManager> wifi_man_;
     std::unique_ptr<HttpServer> server_;
+    std::unique_ptr<HubHttpClient> client_;
     std::unique_ptr<HubOLED> oled_;
     std::unique_ptr<ShiftRegister> shift_register_;
     std::unique_ptr<DCMotor> motor_left_;
@@ -155,8 +157,12 @@ private:
     std::function<bool(long)> on_board_long_pressed_callback_;
     
     // Task handles for proper cleanup
-    TaskHandle_t core_task0_handle_;
-    TaskHandle_t core_task1_handle_;
+    esp_timer_handle_t core_task0_handle_;
+    esp_timer_handle_t core_task1_handle_;
+    unsigned long avg_tick1_interval_us_;
+    unsigned long avg_tick2_interval_us_;
+    unsigned long avg_tick1_duration_us_;
+    unsigned long avg_tick2_duration_us_;
 
 
     // Private helper methods
@@ -208,7 +214,7 @@ private:
     bool loadConfiguration();
     bool saveBaselines();
     bool loadBaselines();
-    bool initNVS();
+    bool initNVS(bool read_only = true);
     bool closeNVS();
     
     float voltageFromADCValue(uint16_t adc_value) const;
@@ -303,7 +309,7 @@ public:
          * @note The handler function should take a HttpRequest, HttpResponse and LineRobotBoard as parameters
          * @return true if route was added successfully, false if server not available
          */
-        bool addHttpRoute(const String& route, std::function<void(HttpRequest*, HttpResponse*, LineRobotBoard*)> handler);
+        bool addHttpRoute(const String& route, std::function<void(HttpRequest*, HubHttpResponse*, LineRobotBoard*)> handler);
 
         /**
          * @brief Set the state of the LED attached to the specified channel of the shift registers.
@@ -551,6 +557,12 @@ public:
          * @param threshold Voltage threshold in volts
          */
         void setInputVoltageAlertThreshold(float threshold);
+
+
+        /**
+         * Gets the HTTP client instance for making outbound requests.
+         */
+        HubHttpClient* getHttpClient();
 };
 
 #endif  // LINEROBOT_BOARD_H
