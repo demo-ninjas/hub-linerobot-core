@@ -799,11 +799,13 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
     
     DCMotor* motor = is_left ? motor_left_.get() : motor_right_.get();
     if (!motor) {
+        logError("Motor object not created");
         return false;
     }
     
     // Check if speed is already set (avoid unnecessary operations)
     if (motor->getSpeed() == speed) {
+        logDebug("Motor speed already set to " + String(speed));
         return true;
     }
     
@@ -838,6 +840,7 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
 void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t current_speed, uint16_t ramp_speed_diff_per_ms) {
     if (ramp_speed_diff_per_ms == 0 || target_speed == current_speed) {
         // No ramping needed
+        logDebug("No ramping needed for " + String(is_left ? "Left" : "Right") + " Motor");
         return;
     }
     
@@ -852,8 +855,10 @@ void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t 
     }
 
     if (is_left) {
+        logDebug("Ramping Left Motor Speed to " + String(new_speed));
         motor_left_->setSpeed(new_speed);
     } else {
+        logDebug("Ramping Right Motor Speed to " + String(new_speed));
         motor_right_->setSpeed(new_speed);
     }
 
@@ -1780,6 +1785,11 @@ float LineRobotBoard::voltageFromADCValue(uint16_t adc_value) const {
     static const float divider_ratio = (r1 + r2) / r2;  // Inverted voltage divider ratio to get actual voltage
     float voltage = (adc_value / 4095.0) * 3.3 * divider_ratio;
     return voltage;
+}
+
+void LineRobotBoard::setInputVoltageAlertThreshold(float voltage) {
+    input_voltage_alert_threshold_ = voltage;
+    logDebug("Input voltage alert threshold set to " + String(voltage) + "v");
 }
 
 HubHttpClient* LineRobotBoard::getHttpClient() {
