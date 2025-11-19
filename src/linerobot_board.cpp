@@ -20,6 +20,10 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     , core_task0_handle_(nullptr)
     , core_task1_handle_(nullptr)
     , input_voltage_alert_threshold_(0.0)  // Default threshold set to 0 volts (special case for auto tuned threshold)
+    , target_motor_speed_left_(0)
+    , target_motor_speed_right_(0)
+    , ramp_speed_diff_per_ms_left_(0)
+    , ramp_speed_diff_per_ms_right_(0)
     , last_voltage_adc_value_(0)
 {
     // Validate input parameters
@@ -528,9 +532,14 @@ void LineRobotBoard::tick1() {
         tickInfraredSensors();
     }
 
+    // Feed the watchdog
+    esp_task_wdt_reset();
+
     // Process the motor ramping at 500Hz (every 4th tick)
     if (tick1_count_ % 4 == 0) {
+        // logDebug("Ramping motors to targets: L=" + String(target_motor_speed_left_) + " R=" + String(target_motor_speed_right_));
         int16_t current_left_speed = getMotorSpeedLeft();
+        // logDebug("Current motor speeds: L=" + String(current_left_speed) + " R=" + String(getMotorSpeedRight()));
         if (target_motor_speed_left_ != current_left_speed) {
             rampMotorSpeed(true, target_motor_speed_left_, current_left_speed, ramp_speed_diff_per_ms_left_);
         }
@@ -538,6 +547,8 @@ void LineRobotBoard::tick1() {
         if (target_motor_speed_right_ != current_right_speed) {
             rampMotorSpeed(false, target_motor_speed_right_, current_right_speed, ramp_speed_diff_per_ms_right_);
         }
+        // Feed the watchdog
+        esp_task_wdt_reset();
     }
 
     // Process accelerometer at ~62.5Hz (every 16th tick) 
@@ -548,20 +559,23 @@ void LineRobotBoard::tick1() {
         if (shift_register_) {
             shift_register_->push_updates();
         }
+
+        // Feed the watchdog
+        esp_task_wdt_reset();
     }
 
     // Every 60000 ticks (60 seconds), reset tick counter to avoid overflow and also get the stack watermark
-    if (tick1_count_ >= 60000) {
-        tick1_count_ = 0;
+    // if (tick1_count_ >= 60000) {
+    //     tick1_count_ = 0;
 
-        // Check stack watermark for CoreTask0
-        if (core_task0_handle_) {
-            UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(nullptr);
-            if (stackWaterMark < 256) {
-                logError("WARNING: Core 1 (Priority tasks) has had a LOW stack availablility: " + String(stackWaterMark));
-            }
-        }
-    }
+    //     // // Check stack watermark for CoreTask0
+    //     // if (core_task0_handle_) {
+    //     //     UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(nullptr);
+    //     //     if (stackWaterMark < 256) {
+    //     //         logError("WARNING: Core 1 (Priority tasks) has had a LOW stack availablility: " + String(stackWaterMark));
+    //     //     }
+    //     // }
+    // }
 
     unsigned long end_time = micros();
     tick_interval_sum += start_time - last_tick_time;
@@ -604,6 +618,9 @@ void LineRobotBoard::tick2() {
     if (alt_board_button_) {
         alt_board_button_->tick();
     }
+
+    // Feed the watchdog
+    esp_task_wdt_reset();
     
     // Process HTTP connections at ~32Hz (every 2nd tick) with error protection
     if (server_ && (tick2_count_ % 2 == 0)) {
@@ -613,6 +630,8 @@ void LineRobotBoard::tick2() {
             try {
                 if (server_->isRunning()) {
                     server_->tick();
+                    // Feed the watchdog
+                    esp_task_wdt_reset();
                 }
             } catch (...) {
                 logError("HTTP server tick exception caught");
@@ -623,49 +642,51 @@ void LineRobotBoard::tick2() {
     }
 
     // Read Voltage Iput at ~1Hz (every 62nd tick)
-    if (tick2_count_ % 62 == 0) {
-        float voltage = getInputVoltageLevel();
-#if SEGMENT_DISPLAY_CONNECTED
-        // Update the voltage display
-        if (voltage_display_) {
-            voltage_display_->showNumberDec(uint32_t(voltage), true, 6, 3);
-        }
-#endif
+//     if (tick2_count_ % 62 == 0) {
+//         float voltage = getInputVoltageLevel();
+// #if SEGMENT_DISPLAY_CONNECTED
+//         // Update the voltage display
+//         if (voltage_display_) {
+//             voltage_display_->showNumberDec(uint32_t(voltage), true, 6, 3);
+//         }
+// #endif
 
-        if (input_voltage_alert_threshold_ < 1.0) {
-            input_voltage_alert_threshold_ += 0.1;
-            if (input_voltage_alert_threshold_ > 0.6) {
-                input_voltage_alert_threshold_ = voltage - 0.9; // Set threshold to 0.9V below current voltage 
-                logDebug("Auto-tuned input voltage alert threshold set to: " + String(input_voltage_alert_threshold_) + "v");
-            }
-        }
+//         if (input_voltage_alert_threshold_ < 1.0) {
+//             input_voltage_alert_threshold_ += 0.1;
+//             if (input_voltage_alert_threshold_ > 0.6) {
+//                 input_voltage_alert_threshold_ = voltage - 0.9; // Set threshold to 0.9V below current voltage 
+//                 logDebug("Auto-tuned input voltage alert threshold set to: " + String(input_voltage_alert_threshold_) + "v");
+//             }
+//         }
         
-        if (voltage < input_voltage_alert_threshold_) {
-            // Turn on the board LED to indicate low voltage (GPIO2)
-            pinMode(2, OUTPUT);
-            if (digitalRead(2) != HIGH) {
-                digitalWrite(2, HIGH);
-                logError("Input voltage low: " + String(voltage) + "v");
-            } else {
-                digitalWrite(2, LOW);
-            }
-        } else {
-            // Turn off the board LED if voltage is above threshold
-            digitalWrite(2, LOW);
-        }
-    }
+//         if (voltage < input_voltage_alert_threshold_) {
+//             // Feed the watchdog
+//             esp_task_wdt_reset();
+//             // Turn on the board LED to indicate low voltage (GPIO2)
+//             pinMode(2, OUTPUT);
+//             if (digitalRead(2) != HIGH) {
+//                 digitalWrite(2, HIGH);
+//                 logError("Input voltage low: " + String(voltage) + "v");
+//             } else {
+//                 digitalWrite(2, LOW);
+//             }
+//         } else {
+//             // Turn off the board LED if voltage is above threshold
+//             digitalWrite(2, LOW);
+//         }
+//     }
 
     // Every 3600 ticks (~60 seconds), reset tick counter to avoid overflow
-    if (tick2_count_ >= 3600) {
-        tick2_count_ = 0;
-        // Check stack watermark for CoreTask1
-        if (core_task1_handle_) {
-            UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(nullptr);
-            if (stackWaterMark < 256) {
-                logError("WARNING: Core 0 (Other Tasks) has had a LOW stack availablility: " + String(stackWaterMark));
-            }
-        }
-    }
+    // if (tick2_count_ >= 3600) {
+    //     tick2_count_ = 0;
+    //     // Check stack watermark for CoreTask1
+    //     // if (core_task1_handle_) {
+    //     //     UBaseType_t stackWaterMark = uxTaskGetStackHighWaterMark(nullptr);
+    //     //     if (stackWaterMark < 256) {
+    //     //         logError("WARNING: Core 0 (Other Tasks) has had a LOW stack availablility: " + String(stackWaterMark));
+    //     //     }
+    //     // }
+    // }
 
     unsigned long end_time = micros();
     tick_interval_sum += start_time - last_tick_time;
