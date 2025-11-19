@@ -138,6 +138,7 @@ private:
     uint16_t ramp_speed_diff_per_ms_right_;
     uint16_t last_voltage_adc_value_;
     float input_voltage_alert_threshold_;
+    bool display_indicator_leds_while_racing_;
     
     // Atomic counters for thread safety
     std::atomic<unsigned long> tick1_count_{0};
@@ -182,8 +183,8 @@ private:
     void resumeTimersAndTasks();
     
     // Core task functions
-    void tick1();  // High-frequency sensor task (Core1, ~500Hz)
-    void tick2();  // Lower-frequency misc tasks (Core0, ~31Hz)
+    void tick1();  // High-frequency sensor task (Core1, ~2kHz)
+    void tick2();  // Lower-frequency misc tasks (Core0, ~62Hz)
     
     // Sensor processing
     void tickInfraredSensors();
@@ -551,6 +552,17 @@ public:
          * @note Returns 0 if voltage reading is not available
          */
         float getInputVoltageLevel();
+
+        /**
+         * @brief Set whether to display indicator LEDs while racing (will slow things down slightly)
+         */
+        void setShowIndicatorLEDsWhileRacing(bool show);
+
+        /**
+         * @brief Get whether indicator LEDs are displayed while racing
+         * @return true if indicator LEDs are displayed while racing
+         */
+        bool isShowingIndicatorLEDsWhileRacing() const { return display_indicator_leds_while_racing_; }
 
         /**
          * @brief Set the voltage threshold for low voltage alerts

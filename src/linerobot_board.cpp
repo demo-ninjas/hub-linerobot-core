@@ -25,6 +25,7 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     , ramp_speed_diff_per_ms_left_(0)
     , ramp_speed_diff_per_ms_right_(0)
     , last_voltage_adc_value_(0)
+    , display_indicator_leds_while_racing_(true)
 {
     // Validate input parameters
     if (!state) {
@@ -233,6 +234,9 @@ bool LineRobotBoard::begin(uint16_t ir_threshold) {
 
     // Feed watchdog after WiFi init
     esp_task_wdt_reset();
+
+    // Set pin mode for onboard LED (pin 2)
+    pinMode(2, OUTPUT);
 
     logDebug("Line Robot Board: Initialisation Complete");
     delay(8); // Brief delay to allow everything to settle (and also allow the user to albeit briefly see the "Ready!" message on the OLED)
@@ -535,8 +539,8 @@ void LineRobotBoard::tick1() {
     // Feed the watchdog
     esp_task_wdt_reset();
 
-    // Process the motor ramping at 500Hz (every 4th tick)
-    if (tick1_count_ % 4 == 0) {
+    // Process the motor ramping at 250Hz (every 8th tick)
+    if (tick1_count_ % 8 == 0) {
         // logDebug("Ramping motors to targets: L=" + String(target_motor_speed_left_) + " R=" + String(target_motor_speed_right_));
         int16_t current_left_speed = getMotorSpeedLeft();
         // logDebug("Current motor speeds: L=" + String(current_left_speed) + " R=" + String(getMotorSpeedRight()));
@@ -551,10 +555,13 @@ void LineRobotBoard::tick1() {
         esp_task_wdt_reset();
     }
 
-    // Process accelerometer at ~62.5Hz (every 16th tick) 
+    // Process accelerometer at ~125Hz (every 16th tick) 
     if (tick1_count_ % 16 == 0) {
         tickAccelerometer();
-        
+    }
+
+    // Update the shift register at 62Hz (every 32nd tick)
+    if (tick1_count_ % 32 == 0) {
         // Update shift register (only if changes are pending)
         if (shift_register_) {
             shift_register_->push_updates();
@@ -710,7 +717,7 @@ bool LineRobotBoard::setLED(uint8_t led, bool on) {
     if (!validateLEDIndex(led) || !shift_register_) {
         return false;
     }
-    shift_register_->set(led, on ? 1 : 0);
+    shift_register_->set(led, on ? 1 : 0, false);
     return true;
 }
 
@@ -826,7 +833,7 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
     
     // Check if speed is already set (avoid unnecessary operations)
     if (motor->getSpeed() == speed) {
-        logDebug("Motor speed already set to " + String(speed));
+        // logDebug("Motor speed already set to " + String(speed));
         return true;
     }
     
@@ -861,7 +868,7 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
 void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t current_speed, uint16_t ramp_speed_diff_per_ms) {
     if (ramp_speed_diff_per_ms == 0 || target_speed == current_speed) {
         // No ramping needed
-        logDebug("No ramping needed for " + String(is_left ? "Left" : "Right") + " Motor");
+        // logDebug("No ramping needed for " + String(is_left ? "Left" : "Right") + " Motor");
         return;
     }
     
@@ -876,27 +883,37 @@ void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t 
     }
 
     if (is_left) {
-        logDebug("Ramping Left Motor Speed to " + String(new_speed));
+        // logDebug("Ramping Left Motor Speed to " + String(new_speed));
         motor_left_->setSpeed(new_speed);
     } else {
-        logDebug("Ramping Right Motor Speed to " + String(new_speed));
+        // logDebug("Ramping Right Motor Speed to " + String(new_speed));
         motor_right_->setSpeed(new_speed);
     }
 
     last_motor_update_ = now;
 }
 
+void LineRobotBoard::setShowIndicatorLEDsWhileRacing(bool show) {
+    display_indicator_leds_while_racing_ = show;
+}
+
 void LineRobotBoard::tickInfraredSensors() {
     // Process all IR sensors
     std::lock_guard<std::mutex> lock(sensor_mutex_);
     
+    bool should_set_indicator_leds = shift_register_ != nullptr &&
+                                     state_ != nullptr &&
+                                     state_->currentState() != LINE_ROBOT_PRIMED && 
+                                     !(state_->currentState() == LINE_ROBOT_RACING && !display_indicator_leds_while_racing_)
+                                     ;
+
     for (uint8_t i = 0; i < NUM_IR_SENSORS; i++) {
         if (!ir_sensors_[i]) continue;
         
         ir_sensors_[i]->tick(true);  // Force ADC update
         
         // Update indicator LEDs (skip during PRIMED state to avoid distractions)
-        if (state_ && state_->currentState() != LINE_ROBOT_PRIMED && shift_register_) {
+        if (should_set_indicator_leds) {
             shift_register_->set(ir_sensors_[i]->getIndicatorLedNum(), 
                                ir_sensors_[i]->isTriggered(), false);
         }
@@ -968,8 +985,13 @@ void LineRobotBoard::onBoardButtonPressedHandler(long time_pressed) {
         state_->setState(LINE_ROBOT_BASELINE_INIT);
         preBaseline();
     } else if (current_state == LINE_ROBOT_BASELINE_INIT) {
-        // Start baselining process
-        baselineIRSensors();
+        if (state_->pose.x > 0.80f || state_->pose.x < -0.80f) {
+            // Held Vertically, so reset baselines
+            resetIRBaselines();
+        } else {
+            // Start baselining process
+            baselineIRSensors();
+        }
     } else if (current_state == LINE_ROBOT_IDLE) {
         // Enter primed state
         state_->setState(LINE_ROBOT_PRIMED);
