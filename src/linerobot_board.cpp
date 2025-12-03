@@ -25,6 +25,7 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     , ramp_speed_diff_per_ms_left_(0)
     , ramp_speed_diff_per_ms_right_(0)
     , last_voltage_adc_value_(0)
+    , last_motor_update_(0)
     , display_indicator_leds_while_racing_(true)
 {
     // Validate input parameters
@@ -839,12 +840,14 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
     
     if (is_left) {
         target_motor_speed_left_ = speed;
-        ramp_speed_diff_per_ms_left_ = (ramp_time_ms > 0) ? 
-            static_cast<float>(speed - motor->getSpeed()) / ramp_time_ms : 0.0f;
+        int16_t speed_diff = abs(speed) - abs(motor->getSpeed());
+        ramp_speed_diff_per_ms_left_ = (ramp_time_ms != 0) ?  std::ceil(  float(abs(speed_diff)) / float(ramp_time_ms)) : 0;
+        // logDebug("Setting Left Motor Target Speed: " + String(speed) + " with ramp time: " + String(ramp_time_ms) + "ms, Diff/ms: " + String(ramp_speed_diff_per_ms_left_) + ", Motor Speed: " + String(motor->getSpeed()) + ", Speed Diff: " + String(speed_diff));
     } else {
         target_motor_speed_right_ = speed;
-        ramp_speed_diff_per_ms_right_ = (ramp_time_ms > 0) ? 
-            static_cast<float>(speed - motor->getSpeed()) / ramp_time_ms : 0.0f;
+        int16_t speed_diff = abs(speed) - abs(motor->getSpeed());
+        ramp_speed_diff_per_ms_right_ = (ramp_time_ms != 0) ? std::ceil(  float(abs(speed_diff)) / float(ramp_time_ms)) : 0;
+        // logDebug("Setting Right Motor Target Speed: " + String(speed) + " with ramp time: " + String(ramp_time_ms) + "ms, Diff/ms: " + String(ramp_speed_diff_per_ms_right_) + ", Motor Speed: " + String(motor->getSpeed()) + ", Speed Diff: " + String(speed_diff));
     }
 
     if (ramp_time_ms == 0) {
@@ -866,16 +869,30 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
 }
 
 void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t current_speed, uint16_t ramp_speed_diff_per_ms) {
-    if (ramp_speed_diff_per_ms == 0 || target_speed == current_speed) {
-        // No ramping needed
+    if (target_speed == current_speed) {
+        return;
+    }
+    if (ramp_speed_diff_per_ms == 0) {
+        // No ramping needed - jumop to target speed
+        if (is_left) {
+            motor_left_->setSpeed(target_speed);
+        } else {
+            motor_right_->setSpeed(target_speed);
+        }
         // logDebug("No ramping needed for " + String(is_left ? "Left" : "Right") + " Motor");
         return;
     }
     
     unsigned long now = millis();
-    unsigned long elapsed_ms = now - last_motor_update_;
+    unsigned long elapsed_ms = last_motor_update_ > 0 ? now - last_motor_update_ : 1;
+    if (elapsed_ms == 0) {
+        elapsed_ms = 1;  // Ensure at least 1ms has elapsed
+    }
 
     int16_t speed_change = static_cast<int16_t>(ramp_speed_diff_per_ms * elapsed_ms);
+    if (target_speed < current_speed && speed_change > 0) {
+        speed_change = -speed_change;  // Force Deceleration
+    }
     int16_t new_speed = current_speed + speed_change;
     if ((ramp_speed_diff_per_ms > 0 && new_speed > target_speed) || 
         (ramp_speed_diff_per_ms < 0 && new_speed < target_speed)) {
@@ -883,10 +900,10 @@ void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t 
     }
 
     if (is_left) {
-        // logDebug("Ramping Left Motor Speed to " + String(new_speed));
+        // logDebug("Ramping Left Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
         motor_left_->setSpeed(new_speed);
     } else {
-        // logDebug("Ramping Right Motor Speed to " + String(new_speed));
+        // logDebug("Ramping Right Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
         motor_right_->setSpeed(new_speed);
     }
 
