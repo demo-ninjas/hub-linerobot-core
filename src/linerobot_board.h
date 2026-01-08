@@ -20,7 +20,6 @@
 #include <array>
 #include <mutex>
 #include <atomic>
-#include <TM1637Display.h>
 
 // Constants
 #define INVALID_ANALOGUE_CHANNEL 65535
@@ -32,7 +31,6 @@
 #define BASELINE_SAMPLE_DURATION_MS 1000
 #define BASELINE_SAMPLE_DELAY_MS 10
 #define ADC_VOLTAGE_PIN 8   // ADC Pin attached to the voltage divider circuit
-#define SEGMENT_DISPLAY_CONNECTED false // Set to true if the segment display is connected
 
 class InfraredSensor {
 public:
@@ -98,6 +96,10 @@ struct RobotConfig {
 
 
 class LineRobotBoard {
+    // Friend declarations for FreeRTOS task wrapper functions
+    friend void coreTask0Wrapper(void* parameter);
+    friend void coreTask1Wrapper(void* parameter);
+    
 public:
     // Disable copy constructor and assignment operator
     LineRobotBoard(const LineRobotBoard&) = delete;
@@ -115,8 +117,10 @@ private:
     std::unique_ptr<LIS3DH> lis3dh_;
     std::unique_ptr<Button> board_button_;
     std::unique_ptr<Button> alt_board_button_;
-    std::unique_ptr<TM1637Display> voltage_display_;
 
+    std::unique_ptr<Button> board_button2_;
+    std::unique_ptr<Button> alt_board_button2_;
+    
     
     // Use array for better memory management
     std::array<std::unique_ptr<InfraredSensor>, NUM_IR_SENSORS> ir_sensors_;
@@ -129,8 +133,10 @@ private:
     bool debug_;
     bool is_initialised_;
     bool timers_running_;
+    bool use_internal_timers_;
     unsigned long start_millis_;
     RobotConfig config_;
+    String ip_address_;
     unsigned long last_motor_update_;
     int target_motor_speed_left_;
     int target_motor_speed_right_;
@@ -139,6 +145,10 @@ private:
     uint16_t last_voltage_adc_value_;
     float input_voltage_alert_threshold_;
     bool display_indicator_leds_while_racing_;
+
+    float motor_driver_input_voltage_;
+    float motor_driver_voltage_drop_;
+    float motor_max_voltage_;
     
     // Atomic counters for thread safety
     std::atomic<unsigned long> tick1_count_{0};
@@ -151,15 +161,19 @@ private:
     // Mutex for thread-safe operations
     mutable std::mutex sensor_mutex_;
     mutable std::mutex motor_mutex_;
+    mutable std::mutex i2c_mutex_;
 
     // Callback functions
     std::function<bool(long)> on_board_pressed_callback_;
     std::function<bool(long)> on_board_double_pressed_callback_;
     std::function<bool(long)> on_board_long_pressed_callback_;
+    std::function<bool(long)> on_board2_pressed_callback_;
+    std::function<bool(long)> on_board2_double_pressed_callback_;
+    std::function<bool(long)> on_board2_long_pressed_callback_;
     
     // Task handles for proper cleanup
-    esp_timer_handle_t core_task0_handle_;
-    esp_timer_handle_t core_task1_handle_;
+    TaskHandle_t core_task0_handle_;
+    TaskHandle_t core_task1_handle_;
     unsigned long avg_tick1_interval_us_;
     unsigned long avg_tick2_interval_us_;
     unsigned long avg_tick1_duration_us_;
@@ -183,7 +197,7 @@ private:
     void resumeTimersAndTasks();
     
     // Core task functions
-    void tick1();  // High-frequency sensor task (Core1, ~2kHz)
+    void tick1();  // High-frequency sensor task (Core1, ~1kHz)
     void tick2();  // Lower-frequency misc tasks (Core0, ~62Hz)
     
     // Sensor processing
@@ -194,6 +208,9 @@ private:
     void onBoardButtonPressedHandler(long time_pressed);
     void onBoardButtonDoublePressedHandler(long time_between_presses);
     void onBoardButtonLongPressedHandler(long time_pressed);
+    void onBoardButton2PressedHandler(long time_pressed);
+    void onBoardButton2DoublePressedHandler(long time_between_presses);
+    void onBoardButton2LongPressedHandler(long time_pressed);
     
     // Baseline management
     void preBaseline();
@@ -219,6 +236,10 @@ private:
     bool closeNVS();
     
     float voltageFromADCValue(uint16_t adc_value) const;
+
+    int motorSpeedFromPercentage(int percentage) const;
+    int percentageFromMotorSpeed(int speed) const;
+    
 public:
         /**
          * @brief Construct a new Line Robot Board object
@@ -235,7 +256,8 @@ public:
                                const String& wifi_ssid = "", 
                                const String& wifi_password = "", 
                                OledDisplayType oled_type = OLED_TYPE_NONE, 
-                               bool debug = false);
+                               bool debug = false, 
+                               bool use_internal_timers = true);
         
         /**
          * @brief Destructor - properly cleans up all resources
@@ -281,7 +303,7 @@ public:
         /**
          * @brief Get the tick count for the core robot tasks loop - this task runs on Core1 of the board (the second CPU core)
          * @note The tick count is wrapped every 60000 ticks (every 60 seconds)
-         * @note This task targets running at ~2kHz (aka. every 500µs)
+         * @note This task targets running at ~1kHz (aka. every 1ms)
          * @return The current board tick count for the main robot task loop
          */
         unsigned long getCoreTasksTickCount() const;
@@ -349,8 +371,8 @@ public:
         void clearOLED();
 
         /**
-         * @brief Set the speed of the left motor with input validation and ramping
-         * @param speed Motor speed (-255 to 255, negative values indicate reverse direction)
+         * @brief Set the percentage speed of the left motor with input validation and ramping
+         * @param speed Motor speed (-100 to 100, negative values indicate reverse direction)
          * @param ramp_time_ms Time to ramp to new speed in milliseconds (0 = immediate)
          * @return true if speed was set successfully
          * @note This function is thread-safe
@@ -358,8 +380,8 @@ public:
         bool setMotorSpeedLeft(int16_t speed, uint16_t ramp_time_ms = 0);
 
         /**
-         * @brief Set the speed of the right motor with input validation and ramping
-         * @param speed Motor speed (-255 to 255, negative values indicate reverse direction)  
+         * @brief Set the percentage speed of the right motor with input validation and ramping
+         * @param speed Motor speed (-100 to 100, negative values indicate reverse direction)  
          * @param ramp_time_ms Time to ramp to new speed in milliseconds (0 = immediate)
          * @return true if speed was set successfully
          * @note This function is thread-safe
@@ -367,31 +389,31 @@ public:
         bool setMotorSpeedRight(int16_t speed, uint16_t ramp_time_ms = 0);
 
         /**
-         * @brief Set the speed of both motors to the same value
-         * @param speed Motor speed (-255 to 255, negative values indicate reverse direction)
+         * @brief Set the percentage speed of both motors to the same value
+         * @param speed Motor speed (-100 to 100, negative values indicate reverse direction)
          * @param ramp_time_ms Time to ramp to new speed in milliseconds (0 = immediate)
          * @return true if both speeds were set successfully
          */
         bool setMotorSpeedBoth(int16_t speed, uint16_t ramp_time_ms = 0);
 
         /**
-         * @brief Set the speed of the left and right motors independently
-         * @param left Left motor speed (-255 to 255, negative values indicate reverse direction)
-         * @param right Right motor speed (-255 to 255, negative values indicate reverse direction)
+         * @brief Set the percentage speed of the left and right motors independently
+         * @param left Left motor speed (-100 to 100, negative values indicate reverse direction)
+         * @param right Right motor speed (-100 to 100, negative values indicate reverse direction)
          * @param ramp_time_ms Time to ramp to new speed in milliseconds (0 = immediate)
          * @return true if both speeds were set successfully
          */
         bool setMotorSpeed(int16_t left, int16_t right, uint16_t ramp_time_ms = 0);
         
         /**
-         * @brief Get current left motor speed
-         * @return Current left motor speed (-255 to 255)
+         * @brief Get current left motor percentage speed
+         * @return Current left motor speed (-100 to 100)
          */
         int16_t getMotorSpeedLeft() const;
         
         /**
-         * @brief Get current right motor speed
-         * @return Current right motor speed (-255 to 255)
+         * @brief Get current right motor percentage speed
+         * @return Current right motor speed (-100 to 100)
          */
         int16_t getMotorSpeedRight() const;
         
@@ -473,6 +495,16 @@ public:
          * @return true if alternate button was added successfully
          */
         bool addAlternateBoardButtonPin(uint8_t pin, bool active_low = true);
+        
+        /**
+         * @brief Add an alternate pin to be used as a board button 2 input in addition to the default board button pin (GPIO18)
+         * @param pin The pin to use as an alternate board button input
+         * @param active_low Whether the button is active low (default: true)
+         * @return true if alternate button was added successfully
+         */
+        bool addAlternateBoardButton2Pin(uint8_t pin, bool active_low = true);
+
+
 
         /**
          * @brief Set the callback function to be called when the board button is pressed
@@ -497,6 +529,30 @@ public:
          * @note The callback function should return true if the event was handled, and false otherwise (and the default board handler will be called)
          */
         void onBoardButtonLongPressed(std::function<bool(long)> callback);
+
+        /**
+         * @brief Set the callback function to be called when the alternate board button (Button 2) is pressed
+         * @param callback The callback function to be called when the alternate board button is pressed
+         * @note The callback function will be called with the time in milliseconds that the button was held pressed down for
+         * @note The callback function should return true if the event was handled, and false otherwise (and the default board handler will be called)
+         */
+        void onBoardButton2Pressed(std::function<bool(long)> callback);
+
+        /**
+         * @brief Set the callback function to be called when the alternate board button (Button 2) is double pressed
+         * @param callback The callback function to be called when the alternate board button is double pressed
+         * @note The callback function will be called with the time in milliseconds between the two presses
+         * @note The callback function should return true if the event was handled, and false otherwise (and the default board handler will be called)
+         */
+        void onBoardButton2DoublePressed(std::function<bool(long)> callback);
+
+        /**
+         * @brief Set the callback function to be called when the alternate board button (Button 2) is long pressed
+         * @param callback The callback function to be called when the alternate board button is long pressed
+         * @note The callback function will be called with the time in milliseconds that the button was held pressed down for
+         * @note The callback function should return true if the event was handled, and false otherwise (and the default board handler will be called)
+         */
+        void onBoardButton2LongPressed(std::function<bool(long)> callback);
         
         // New diagnostic and utility functions
         
@@ -575,6 +631,37 @@ public:
          * Gets the HTTP client instance for making outbound requests.
          */
         HubHttpClient* getHttpClient();
+
+        /**
+         * @brief Set the motor driver input voltage to ennsure proper PWM scaling for the attached motors
+         * @param voltage_mv Input voltage
+         */
+        void setMotorDriverInputVoltage(uint16_t voltage_mv);
+
+        /**
+         * @brief Set the motor driver voltage drop to ensure proper PWM scaling for the attached motors
+         * @param voltage_drop_ Voltage drop across the motor driver
+         */
+        void setMotorDriverVoltageDrop(uint16_t voltage_drop);
+
+        /**
+         * @brief Set the maximum motor voltage to ensure proper PWM scaling for the attached motors
+         * @param max_voltage Maximum motor voltage
+         */
+        void setMotorMaxVoltage(uint16_t max_voltage);
+        
+        /**
+         * @brief Get the IP address assigned to the board (if connected to WiFi)
+         * @return IP address as a string
+         */
+        String getIpAddress() const { return ip_address_; }
+
+
+        /**
+         * @brief Manually trigger a tick of the board's internal tasks
+         * WARNING: Only use this if you have disabled the internal timers and tasks (when setting use_internal_timers to false on board construction)
+         */
+        void tick();
 };
 
 #endif  // LINEROBOT_BOARD_H

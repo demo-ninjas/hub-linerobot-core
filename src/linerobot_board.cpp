@@ -2,6 +2,8 @@
 #include "linerobot_board.h"
 #include "driver/timer.h"
 #include <Wire.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <cmath>
 #include <algorithm>
 #include <esp_task_wdt.h>
@@ -9,7 +11,7 @@
 
 LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger, 
                               const String& wifi_ssid, const String& wifi_password, 
-                              OledDisplayType oled_type, bool debug) 
+                              OledDisplayType oled_type, bool debug, bool use_internal_timers) 
     : logger_(&logger)
     , state_(state)
     , debug_(debug)
@@ -27,6 +29,11 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     , last_voltage_adc_value_(0)
     , last_motor_update_(0)
     , display_indicator_leds_while_racing_(true)
+    , motor_driver_input_voltage_(9.0)
+    , motor_driver_voltage_drop_(0.5)
+    , motor_max_voltage_(6)
+    , use_internal_timers_(use_internal_timers)
+    , ip_address_("")
 {
     // Validate input parameters
     if (!state) {
@@ -35,20 +42,34 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     if (!logger_) {
         throw std::invalid_argument("CachingPrinter cannot be null");
     }
+    
+    // Set Pull-Down resistors on 41 and 42 (open GPIO pins on board with attached LEDs)
+    gpio_pulldown_en(GPIO_NUM_41);
+    gpio_pulldown_en(GPIO_NUM_42);
+
+    // Set Pull-Down resistors on motor control pins to ensure motors are off by default
+    gpio_pulldown_en(GPIO_NUM_12);
+    gpio_pulldown_en(GPIO_NUM_38);
+
 
     // Initialise Serial communication
     Serial.begin(9600);  // Whilst a higher baud rate should be used for better performance, it seems to be problematic on the robot board hardware
     
     // Initialise I2C Bus
     Wire.begin(15, 16);         // SDA, SCL pins for Robot Board
-    Wire.setClock(400000);      // Set the I2C clock speed to 400kHz
+    Wire.setClock(100000);      // The slower 100kHz is more stable on the ESP32S3
+    delay(50);  // Allow I2C bus to stabilize
+    esp_task_wdt_reset();
 
     // Wait briefly for Serial connection
     unsigned long serial_timeout = millis() + 200;
     while (!Serial && millis() < serial_timeout) {
         delay(10);  // Wait for a bit...
+        esp_task_wdt_reset();   // Feed the watchdog during wait
     }
     esp_task_wdt_reset();   // Feed the watchdog after waiting for Serial
+    
+    // Logging MUST come after Serial is ready
     logDebug("Line Robot: Initialising...");
 
     // Initialise NVS (Non-Volatile Storage)
@@ -80,6 +101,7 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
         wifi_man_ = std::unique_ptr<WifiManager>(new WifiManager(wifi_ssid, wifi_password));
         wifi_man_->onConnected([this](String ip) {
             logDebug("Connected to WiFi: " + ip);
+            ip_address_ = ip;
             if (oled_) {
                 oled_->setLine(1, ip, true);
             }
@@ -103,18 +125,18 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     motor_right_ = std::unique_ptr<DCMotor>(new DCMotor(38, 39, 40));
     lis3dh_ = std::unique_ptr<LIS3DH>(new LIS3DH(I2C_MODE, 0x19));
 
-    // Initialise the Segment Display
-#if SEGMENT_DISPLAY_CONNECTED
-    voltage_display_ = std::unique_ptr<TM1637Display>(new TM1637Display(41, 42));  // CLK, DIO pins
-    voltage_display_->setBrightness(0x08);  // Half Brightness
-    voltage_display_->clear();
-#endif
-
     // Setup board button with proper binding
     board_button_ = std::unique_ptr<Button>(new Button(21, 25, false, true, 1000, 300));
     board_button_->onPressed([this](long time) { onBoardButtonPressedHandler(time); });
     board_button_->onDoublePressed([this](long time) { onBoardButtonDoublePressedHandler(time); });
     board_button_->onLongPressed([this](long time) { onBoardButtonLongPressedHandler(time); });
+
+    // Setup Board Button 2 with proper binding
+    board_button2_ = std::unique_ptr<Button>(new Button(8, 25, false, true, 1000, 300));
+    board_button2_->onPressed([this](long time) { onBoardButton2PressedHandler(time); });
+    board_button2_->onDoublePressed([this](long time) { onBoardButton2DoublePressedHandler(time); });
+    board_button2_->onLongPressed([this](long time) { onBoardButton2LongPressedHandler(time); });   
+
 }
 
 LineRobotBoard::~LineRobotBoard() {
@@ -163,7 +185,10 @@ bool LineRobotBoard::begin(uint16_t ir_threshold) {
 
     
     // Initialise OLED first for status display
-    oled_->init();
+    {
+        std::lock_guard<std::mutex> lock(i2c_mutex_);
+        oled_->init();
+    }
     oled_->setLine(0, "Initializing...", true);
     logDebug("OLED Initialised");
     
@@ -215,14 +240,19 @@ bool LineRobotBoard::begin(uint16_t ir_threshold) {
     esp_task_wdt_reset();  // Feed watchdog after IR sensors init
 
     // Setup core tasks
-    oled_->setLine(3, "Starting tasks...", true);
-    delay(8);  // Brief delay to allow previous operations to settle before starting the timers + tasks
-    if (!setupTimersAndTasks()) {
-        logError("Failed to setup timers and tasks");
-        return false;
+    if (!use_internal_timers_) {
+        logDebug("Skipping internal timers and tasks setup as per configuration");
+        oled_->setLine(2, "Skipping tasks...", true);
+    } else {
+        oled_->setLine(3, "Starting tasks...", true);
+        delay(8);  // Brief delay to allow previous operations to settle before starting the timers + tasks
+        if (!setupTimersAndTasks()) {
+            logError("Failed to setup timers and tasks");
+            return false;
+        }
+        logDebug("Timers and Tasks Initialised");
+            
     }
-    logDebug("Timers and Tasks Initialised");
-        
     is_initialised_ = true;
     oled_->setLine(1, "Ready!", true);
     oled_->setLine(3, "", true);  // Clear status line
@@ -258,76 +288,82 @@ void LineRobotBoard::end() {
     logDebug("Line Robot Board: Shutdown complete");
 }
 
+// Wrapper functions for FreeRTOS tasks
+void coreTask0Wrapper(void* parameter) {
+    LineRobotBoard* board = static_cast<LineRobotBoard*>(parameter);
+    TickType_t xTicksStart = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(1);  // 1ms = 1kHz
+    
+    while (true) {
+        board->tick1();
+        xTaskDelayUntil(&xTicksStart, xFrequency);
+    }
+}
+
+void coreTask1Wrapper(void* parameter) {
+    LineRobotBoard* board = static_cast<LineRobotBoard*>(parameter);
+    TickType_t xTicksStart = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(16);  // 16ms = 62.5Hz
+    
+    while (true) {
+        board->tick2();
+        xTaskDelayUntil(&xTicksStart, xFrequency);
+    }
+}
+
 bool LineRobotBoard::setupTimersAndTasks() {
     if (timers_running_) {
-        logError("Timers already running");
+        logError("Tasks already running");
         return false;
     }
     
     // Feed the watchdog to prevent timeout during initialization
     esp_task_wdt_reset();
     
-    // Create esp_timer configuration for high-frequency timer (2kHz, 500us)
-    esp_timer_create_args_t timer0_args = {
-        .callback = [](void* arg) {
-            LineRobotBoard* board = static_cast<LineRobotBoard*>(arg);
-            board->tick1();
-        },
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,  // Run in timer task context, not ISR
-        .name = "CoreTimer0",
-        .skip_unhandled_events = true  // Skip if previous callback is still running
-    };
-
-    esp_timer_handle_t core_timer0_handle = nullptr;
-    esp_err_t err = esp_timer_create(&timer0_args, &core_timer0_handle);
-    if (err != ESP_OK) {
-        logError("Failed to create CoreTimer0: " + String(esp_err_to_name(err)));
+    // Create high-frequency task (1kHz) on Core 1
+    // Stack size: 4096 bytes, Priority: 2 (higher than loop)
+    BaseType_t result = xTaskCreatePinnedToCore(
+        coreTask0Wrapper,     // Task function
+        "CoreTask0",          // Task name
+        8192,                // Stack size (bytes)
+        this,                 // Parameter
+        2,                    // Priority
+        &core_task0_handle_,  // Task handle
+        1                     // Core 1
+    );
+    
+    if (result != pdPASS || core_task0_handle_ == nullptr) {
+        logError("Failed to create CoreTask0");
         return false;
     }
     
-    // Store timer handles (you'll need to add these as member variables)
-    core_task0_handle_ = core_timer0_handle;
-    // Start the timer
-    err = esp_timer_start_periodic(core_task0_handle_, 500);  // 500 microseconds
-    if (err != ESP_OK) {
-        logError("Failed to start CoreTimer0: " + String(esp_err_to_name(err)));
-        return false;
-    }
-
-
-    // Create esp_timer configuration for low-frequency timer (62.5Hz, 16ms)
-    esp_timer_create_args_t timer1_args = {
-        .callback = [](void* arg) {
-            LineRobotBoard* board = static_cast<LineRobotBoard*>(arg);
-            board->tick2();
-        },
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,  // Run in timer task context, not ISR
-        .name = "CoreTimer1",
-        .skip_unhandled_events = true  // Skip if previous callback is still running
-    };
-
-    esp_timer_handle_t core_timer1_handle = nullptr;
-    err = esp_timer_create(&timer1_args, &core_timer1_handle);
-    if (err != ESP_OK) {
-        logError("Failed to create CoreTimer1: " + String(esp_err_to_name(err)));
+    // Create low-frequency task (62.5Hz) on Core 0
+    // Stack size: 8192 bytes (larger for HTTP server operations), Priority: 1
+    result = xTaskCreatePinnedToCore(
+        coreTask1Wrapper,     // Task function
+        "CoreTask1",          // Task name
+        16384,                // Stack size (bytes) - increased for HTTP operations
+        this,                 // Parameter
+        1,                    // Priority
+        &core_task1_handle_,  // Task handle
+        0                     // Core 0
+    );
+    
+    if (result != pdPASS || core_task1_handle_ == nullptr) {
+        logError("Failed to create CoreTask1");
+        // Clean up task0 if task1 creation failed
+        if (core_task0_handle_ != nullptr) {
+            vTaskDelete(core_task0_handle_);
+            core_task0_handle_ = nullptr;
+        }
         return false;
     }
     
-    core_task1_handle_ = core_timer1_handle;
-
-    err = esp_timer_start_periodic(core_task1_handle_, 16000);  // 16000 microseconds (16ms)
-    if (err != ESP_OK) {
-        logError("Failed to start CoreTimer1: " + String(esp_err_to_name(err)));
-        return false;
-    }
-    
-    // Final watchdog feed for the tasks setup
+    // Final watchdog feed after tasks setup
     esp_task_wdt_reset();
     
     timers_running_ = true;
-    logDebug("Timers and tasks started successfully");
+    logDebug("FreeRTOS tasks started successfully");
     return true;
 }
 
@@ -336,29 +372,47 @@ void LineRobotBoard::cleanupTimersAndTasks() {
         return;
     }
     
-    logDebug("Cleaning up timers and tasks...");
+    logDebug("Cleaning up FreeRTOS tasks...");
     
-    // Stop and deinitialise timers
-    esp_timer_stop(core_task0_handle_);
-    esp_timer_stop(core_task1_handle_);
-    esp_timer_delete(core_task0_handle_);
-    esp_timer_delete(core_task1_handle_);
+    // Delete FreeRTOS tasks
+    if (core_task0_handle_ != nullptr) {
+        vTaskDelete(core_task0_handle_);
+        core_task0_handle_ = nullptr;
+    }
+    
+    if (core_task1_handle_ != nullptr) {
+        vTaskDelete(core_task1_handle_);
+        core_task1_handle_ = nullptr;
+    }
+    
+    // Small delay to ensure tasks are fully cleaned up
+    vTaskDelay(pdMS_TO_TICKS(10));
     
     timers_running_ = false;
-    logDebug("Timers and tasks cleaned up");
+    logDebug("FreeRTOS tasks cleaned up");
 }
 
 void LineRobotBoard::pauseTimersAndTasks() {
     if (timers_running_) {
-        esp_timer_stop(core_task0_handle_);
-        esp_timer_stop(core_task1_handle_);
+        logDebug("Suspending FreeRTOS tasks...");
+        if (core_task0_handle_ != nullptr) {
+            vTaskSuspend(core_task0_handle_);
+        }
+        if (core_task1_handle_ != nullptr) {
+            vTaskSuspend(core_task1_handle_);
+        }
     }
 }
 
 void LineRobotBoard::resumeTimersAndTasks() {
     if (timers_running_) {
-        esp_timer_start_periodic(core_task0_handle_, 500);
-        esp_timer_start_periodic(core_task1_handle_, 16000);        
+        logDebug("Resuming FreeRTOS tasks...");
+        if (core_task0_handle_ != nullptr) {
+            vTaskResume(core_task0_handle_);
+        }
+        if (core_task1_handle_ != nullptr) {
+            vTaskResume(core_task1_handle_);
+        }
     }
 }
 
@@ -391,6 +445,9 @@ bool LineRobotBoard::initAccelerometer() {
         return false;
     }
     
+    // Protect I2C bus access with mutex
+    std::lock_guard<std::mutex> lock(i2c_mutex_);
+    
     // Configure accelerometer settings
     lis3dh_->settings.adcEnabled = 0;
     lis3dh_->settings.tempEnabled = 0;
@@ -401,12 +458,13 @@ bool LineRobotBoard::initAccelerometer() {
     lis3dh_->settings.zAccelEnabled = 1;
     lis3dh_->settings.fifoEnabled = 0;         // Disable FIFO for simplicity
     
+    // Not calling begin as the library code is attempting to start the I2C bus again
     // Initialise and apply settings
-    uint16_t result = lis3dh_->begin();
-    if (result != 0) {
-        logError("Failed to initialise LIS3DH accelerometer: " + String(result));
-        return false;
-    }
+    // uint16_t result = lis3dh_->begin();
+    // if (result != 0) {
+    //     logError("Failed to initialise LIS3DH accelerometer: " + String(result));
+    //     return false;
+    // }
     
     lis3dh_->applySettings();
     logDebug("Accelerometer initialised with range ±4g at 100Hz");
@@ -517,6 +575,15 @@ bool LineRobotBoard::initInfraredSensors(uint16_t ir_threshold) {
     return true;
 }
 
+void LineRobotBoard::tick() {
+    tick1();
+    static unsigned long last_tick2_time = 0;
+    if (millis() - last_tick2_time >= 16) {  // Approximately every 16ms
+        last_tick2_time = millis();
+        tick2();
+    }
+}
+
 void LineRobotBoard::tick1() {
     tick1_count_++;
 
@@ -530,9 +597,9 @@ void LineRobotBoard::tick1() {
 
     unsigned long start_time = micros();
 
-    // High-frequency sensor processing (2kHz)
+    // High-frequency sensor processing (1kHz)
 
-    // Process IR sensors at 1kHz (every tick)
+    // Process IR sensors at 500Hz (every other tick)
     if (tick1_count_ % 2 == 0) {
         tickInfraredSensors();
     }
@@ -540,8 +607,8 @@ void LineRobotBoard::tick1() {
     // Feed the watchdog
     esp_task_wdt_reset();
 
-    // Process the motor ramping at 250Hz (every 8th tick)
-    if (tick1_count_ % 8 == 0) {
+    // Process the motor ramping at 250Hz (every 4th tick)
+    if (tick1_count_ % 4 == 0) {
         // logDebug("Ramping motors to targets: L=" + String(target_motor_speed_left_) + " R=" + String(target_motor_speed_right_));
         int16_t current_left_speed = getMotorSpeedLeft();
         // logDebug("Current motor speeds: L=" + String(current_left_speed) + " R=" + String(getMotorSpeedRight()));
@@ -556,13 +623,13 @@ void LineRobotBoard::tick1() {
         esp_task_wdt_reset();
     }
 
-    // Process accelerometer at ~125Hz (every 16th tick) 
-    if (tick1_count_ % 16 == 0) {
+    // Process accelerometer at ~125Hz (every 8th tick) 
+    if (tick1_count_ % 8 == 0) {
         tickAccelerometer();
     }
 
-    // Update the shift register at 62Hz (every 32nd tick)
-    if (tick1_count_ % 32 == 0) {
+    // Update the shift register at 62Hz (every 16th tick)
+    if (tick1_count_ % 16 == 0) {
         // Update shift register (only if changes are pending)
         if (shift_register_) {
             shift_register_->push_updates();
@@ -627,6 +694,13 @@ void LineRobotBoard::tick2() {
         alt_board_button_->tick();
     }
 
+    if (board_button2_) {
+        board_button2_->tick();
+    }
+    if (alt_board_button2_) {
+        alt_board_button2_->tick();
+    }
+
     // Feed the watchdog
     esp_task_wdt_reset();
     
@@ -652,13 +726,6 @@ void LineRobotBoard::tick2() {
     // Read Voltage Iput at ~1Hz (every 62nd tick)
 //     if (tick2_count_ % 62 == 0) {
 //         float voltage = getInputVoltageLevel();
-// #if SEGMENT_DISPLAY_CONNECTED
-//         // Update the voltage display
-//         if (voltage_display_) {
-//             voltage_display_->showNumberDec(uint32_t(voltage), true, 6, 3);
-//         }
-// #endif
-
 //         if (input_voltage_alert_threshold_ < 1.0) {
 //             input_voltage_alert_threshold_ += 0.1;
 //             if (input_voltage_alert_threshold_ > 0.6) {
@@ -780,12 +847,36 @@ bool LineRobotBoard::setMotorSpeed(int16_t left, int16_t right, uint16_t ramp_ti
 
 int16_t LineRobotBoard::getMotorSpeedLeft() const {
     std::lock_guard<std::mutex> lock(motor_mutex_);
-    return motor_left_ ? motor_left_->getSpeed() : 0;
+    return motor_left_ ? percentageFromMotorSpeed(motor_left_->getSpeed()) : 0;
 }
 
 int16_t LineRobotBoard::getMotorSpeedRight() const {
     std::lock_guard<std::mutex> lock(motor_mutex_);
-    return motor_right_ ? motor_right_->getSpeed() : 0;
+    return motor_right_ ? percentageFromMotorSpeed(motor_right_->getSpeed()) : 0;
+}
+
+int LineRobotBoard::motorSpeedFromPercentage(int percentage) const {
+    // Clamp percentage to -100 to 100
+    if (percentage < -100) percentage = -100;
+    if (percentage > 100) percentage = 100;
+
+    // Scale the percentage to motor speed range
+    float max_speed = (float)motor_max_voltage_ / ((float)motor_driver_input_voltage_ - (float)motor_driver_voltage_drop_) * (float)MAX_MOTOR_SPEED;
+    
+    int val = static_cast<int>(std::round(((float)percentage / 100.0) * max_speed));
+    // logger_->println("Converted percentage " + String(percentage) + "% to motor speed " + String(val) + " (Max Speed: " + String(max_speed) + ")");
+    return val;
+}
+
+int LineRobotBoard::percentageFromMotorSpeed(int speed) const {
+    // Scale the motor speed back to percentage
+    float max_speed = (float)motor_max_voltage_ / ((float)motor_driver_input_voltage_ - (float)motor_driver_voltage_drop_) * (float)MAX_MOTOR_SPEED;
+    
+    // Clamp speed to -max_speed to max_speed
+    if (speed < -max_speed) speed = -max_speed;
+    if (speed > max_speed) speed = max_speed;
+
+    return static_cast<int>(std::round(((float)speed / static_cast<float>(max_speed)) * 100.0));
 }
 
 void LineRobotBoard::emergencyStop() {
@@ -832,6 +923,9 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
         return false;
     }
     
+    // Convert percentage speed to actual motor speed
+    speed = motorSpeedFromPercentage(speed);
+
     // Check if speed is already set (avoid unnecessary operations)
     if (motor->getSpeed() == speed) {
         // logDebug("Motor speed already set to " + String(speed));
@@ -861,7 +955,7 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
                 state_->motor_speed_right = speed;
             }
         }
-        logDebug("Set " + String(is_left ? "Left" : "Right") + " Motor Speed: " + String(speed));
+        //logDebug("Set " + String(is_left ? "Left" : "Right") + " Motor Speed: " + String(speed));
     }
     
     last_motor_update_ = millis();
@@ -900,10 +994,10 @@ void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t 
     }
 
     if (is_left) {
-        // logDebug("Ramping Left Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
+        logDebug("Ramping Left Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
         motor_left_->setSpeed(new_speed);
     } else {
-        // logDebug("Ramping Right Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
+        logDebug("Ramping Right Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
         motor_right_->setSpeed(new_speed);
     }
 
@@ -964,6 +1058,9 @@ void LineRobotBoard::tickInfraredSensors() {
 
 void LineRobotBoard::tickAccelerometer() {
     if (!lis3dh_ || !state_) return;
+    
+    // Protect I2C bus access with mutex to prevent conflicts
+    std::lock_guard<std::mutex> lock(i2c_mutex_);
     
     // Read accelerometer values efficiently
     float accel_x = lis3dh_->readFloatAccelX();
@@ -1068,6 +1165,31 @@ void LineRobotBoard::onBoardButtonLongPressedHandler(long time_pressed) {
     }
 }
 
+void LineRobotBoard::onBoardButton2PressedHandler(long time_pressed) {
+    logDebug("Board Button2 Pressed: " + String(time_pressed) + "ms");
+    if (on_board2_pressed_callback_ && on_board2_pressed_callback_(time_pressed)) {
+        return;  // Custom handler processed the event
+    }
+    // No default action
+}
+
+void LineRobotBoard::onBoardButton2DoublePressedHandler(long time_between_presses) {
+    logDebug("Board Button2 Double Pressed: " + String(time_between_presses) + "ms");
+    if (on_board2_double_pressed_callback_ && 
+        on_board2_double_pressed_callback_(time_between_presses)) {
+        return;  // Custom handler processed the event
+    }
+    // No default action
+}
+void LineRobotBoard::onBoardButton2LongPressedHandler(long time_pressed) {
+    logDebug("Board Button2 Long Pressed: " + String(time_pressed) + "ms");
+    if (on_board2_long_pressed_callback_ && 
+        on_board2_long_pressed_callback_(time_pressed)) {
+        return;  // Custom handler processed the event
+    }
+    // No default action
+}
+
 
 void LineRobotBoard::onBoardButtonPressed(std::function<bool(long)> callback) {
     on_board_pressed_callback_ = callback;
@@ -1077,6 +1199,16 @@ void LineRobotBoard::onBoardButtonDoublePressed(std::function<bool(long)> callba
 }
 void LineRobotBoard::onBoardButtonLongPressed(std::function<bool(long)> callback) {
     on_board_long_pressed_callback_ = callback;
+}
+
+void LineRobotBoard::onBoardButton2Pressed(std::function<bool(long)> callback) {
+    on_board2_pressed_callback_ = callback;
+}
+void LineRobotBoard::onBoardButton2DoublePressed(std::function<bool(long)> callback) {
+    on_board2_double_pressed_callback_ = callback;
+}
+void LineRobotBoard::onBoardButton2LongPressed(std::function<bool(long)> callback) {
+    on_board2_long_pressed_callback_ = callback;
 }
 
 
@@ -1280,6 +1412,7 @@ void LineRobotBoard::addDefaultRoutes() {
     server_->on("/adc", [this](HttpRequest& req) {
         HubHttpResponse resp;
         resp.status = 200;
+        resp.body.reserve(256);  // Pre-allocate to reduce fragmentation
         
         // Avoid large string concatenations - build response incrementally
         if (req.jsonRequested()) {
@@ -1319,6 +1452,7 @@ void LineRobotBoard::addDefaultRoutes() {
     server_->on("/ir", [this](HttpRequest& req) {
         HubHttpResponse resp;
         resp.status = 200;
+        resp.body.reserve(256);  // Pre-allocate to reduce fragmentation
         
         uint8_t sensor_mask = getIRSensorMask();
         if (req.jsonRequested()) {
@@ -1362,33 +1496,31 @@ void LineRobotBoard::addDefaultRoutes() {
             return resp;
         }
         
+        HubHttpResponse resp;
+        resp.status = 200;
+        resp.body.reserve(384);  // Pre-allocate to reduce fragmentation
+        
         if (req.jsonRequested()) {
-            String response_str = "{\n";
-            response_str += "  \"x\": " + String(state_->pose.x, 6) + ",\n";
-            response_str += "  \"y\": " + String(state_->pose.y, 6) + ",\n";
-            response_str += "  \"z\": " + String(state_->pose.z, 6) + ",\n";
-            response_str += "  \"speed\": " + String(state_->pose.speed, 6) + ",\n";
-            response_str += "  \"heading\": " + String(state_->pose.heading, 6) + ",\n";
-            response_str += "  \"last_update\": " + String(state_->pose.last_update_time) + "\n";
-            response_str += "}";
+            resp.body = "{\n";
+            resp.body += "  \"x\": " + String(state_->pose.x, 6) + ",\n";
+            resp.body += "  \"y\": " + String(state_->pose.y, 6) + ",\n";
+            resp.body += "  \"z\": " + String(state_->pose.z, 6) + ",\n";
+            resp.body += "  \"speed\": " + String(state_->pose.speed, 6) + ",\n";
+            resp.body += "  \"heading\": " + String(state_->pose.heading, 6) + ",\n";
+            resp.body += "  \"last_update\": " + String(state_->pose.last_update_time) + "\n";
+            resp.body += "}";
             
-            HubHttpResponse resp;
-            resp.status = 200;
-            resp.body = response_str;
             resp.headers["Content-Type"] = "application/json";
             return resp;
         } else {
-            String response_str = "Robot Pose & Motion:\n";
-            response_str += "  Acceleration X: " + String(state_->pose.x, 3) + " g\n";
-            response_str += "  Acceleration Y: " + String(state_->pose.y, 3) + " g\n";
-            response_str += "  Acceleration Z: " + String(state_->pose.z, 3) + " g\n";
-            response_str += "  Speed: " + String(state_->pose.speed, 3) + " m/s\n";
-            response_str += "  Heading: " + String(state_->pose.heading, 3) + " rad\n";
-            response_str += "  Last Update: " + String(state_->pose.last_update_time) + " ms\n";
+            resp.body = "Robot Pose & Motion:\n";
+            resp.body += "  Acceleration X: " + String(state_->pose.x, 3) + " g\n";
+            resp.body += "  Acceleration Y: " + String(state_->pose.y, 3) + " g\n";
+            resp.body += "  Acceleration Z: " + String(state_->pose.z, 3) + " g\n";
+            resp.body += "  Speed: " + String(state_->pose.speed, 3) + " m/s\n";
+            resp.body += "  Heading: " + String(state_->pose.heading, 3) + " rad\n";
+            resp.body += "  Last Update: " + String(state_->pose.last_update_time) + " ms\n";
         
-            HubHttpResponse resp;
-            resp.status = 200;
-            resp.body = response_str;
             resp.headers["Content-Type"] = "text/plain";
             return resp;
         }
@@ -1466,7 +1598,7 @@ bool LineRobotBoard::validateSensorIndex(uint8_t sensor) const {
 }
 
 bool LineRobotBoard::validateMotorSpeed(int16_t speed) const {
-    return speed >= MIN_MOTOR_SPEED && speed <= MAX_MOTOR_SPEED;
+    return speed >= -100 && speed <= 100;
 }
 
 bool LineRobotBoard::validateLEDIndex(uint8_t led) const {
@@ -1582,11 +1714,35 @@ bool LineRobotBoard::addAlternateBoardButtonPin(uint8_t pin, bool active_low) {
     }
 }
 
+bool LineRobotBoard::addAlternateBoardButton2Pin(uint8_t pin, bool active_low) {
+    if (alt_board_button2_) {
+        logError("Alternate button2 already configured");
+        return false;
+    }
+    
+    try {
+        alt_board_button2_ = std::unique_ptr<Button>(new Button(pin, 25, false, active_low, 1000, 500));
+        alt_board_button2_->onPressed([this](long time) { onBoardButton2PressedHandler(time); });
+        alt_board_button2_->onDoublePressed([this](long time) { onBoardButton2DoublePressedHandler(time); });
+        alt_board_button2_->onLongPressed([this](long time) { onBoardButton2LongPressedHandler(time); });
+        
+        logDebug("Alternate board button2 configured on pin " + String(pin));
+        return true;
+    } catch (const std::exception& e) {
+        logError("Failed to create alternate button2: " + String(e.what()));
+        return false;
+    }
+}
+
+
 // Diagnostic and Status Methods
 bool LineRobotBoard::getAccelerometerReading(float& x, float& y, float& z) const {
     if (!lis3dh_) {
         return false;
     }
+    
+    // Protect I2C bus access with mutex
+    std::lock_guard<std::mutex> lock(i2c_mutex_);
     
     x = lis3dh_->readFloatAccelX();
     y = lis3dh_->readFloatAccelY();
@@ -1596,7 +1752,10 @@ bool LineRobotBoard::getAccelerometerReading(float& x, float& y, float& z) const
 }
 
 String LineRobotBoard::performDiagnostic() const {
-    String report = "=== LineRobot Diagnostic Report ===\n";
+    String report;
+    report.reserve(1024);  // Pre-allocate to reduce fragmentation
+    
+    report = "=== LineRobot Diagnostic Report ===\n";
     
     // System Info
     report += "Board Version: " + String(BOARD_VERSION) + "\n";
@@ -1652,7 +1811,10 @@ String LineRobotBoard::performDiagnostic() const {
 }
 
 String LineRobotBoard::getSystemStatus() const {
-    String status = "{\n";
+    String status;
+    status.reserve(512);  // Pre-allocate to reduce fragmentation
+    
+    status = "{\n";
     status += "  \"version\": \"" + String(BOARD_VERSION) + "\",\n";
     status += "  \"type\": \"" + String(BOARD_TYPE) + "\",\n";
     status += "  \"uptime\": " + String(getUptime()) + ",\n";
@@ -1752,8 +1914,9 @@ String LineRobotBoard::getConfigKey(const String& key) const {
 }
 
 bool LineRobotBoard::saveBaselines() {    
-    std::lock_guard<std::mutex> lock(sensor_mutex_);
     pauseTimersAndTasks();
+    
+    std::lock_guard<std::mutex> lock(sensor_mutex_);
     if (!initNVS(false)) {
         resumeTimersAndTasks();
         return false;
@@ -1779,10 +1942,9 @@ bool LineRobotBoard::saveBaselines() {
 }
 
 bool LineRobotBoard::loadBaselines() {
-    std::lock_guard<std::mutex> lock(sensor_mutex_);
-    
-    // Pause timers and tasks to ensure safe loading
     pauseTimersAndTasks();
+    
+    std::lock_guard<std::mutex> lock(sensor_mutex_);
 
     if (!initNVS(true)) {
         logError("Cannot load baselines - NVS not available - using default baseline of 0");
@@ -1850,6 +2012,21 @@ float LineRobotBoard::voltageFromADCValue(uint16_t adc_value) const {
 void LineRobotBoard::setInputVoltageAlertThreshold(float voltage) {
     input_voltage_alert_threshold_ = voltage;
     logDebug("Input voltage alert threshold set to " + String(voltage) + "v");
+}
+
+void LineRobotBoard::setMotorDriverVoltageDrop(uint16_t voltage_drop) {
+    motor_driver_voltage_drop_ = voltage_drop;
+    logDebug("Motor driver voltage drop set to " + String(voltage_drop) + "v");
+}
+
+void LineRobotBoard::setMotorDriverInputVoltage(uint16_t voltage) {
+    motor_driver_input_voltage_ = voltage;
+    logDebug("Motor driver input voltage set to " + String(voltage) + "v");
+}
+
+void LineRobotBoard::setMotorMaxVoltage(uint16_t voltage) {
+    motor_max_voltage_ = voltage;
+    logDebug("Motor max voltage set to " + String(voltage) + "v");
 }
 
 HubHttpClient* LineRobotBoard::getHttpClient() {
