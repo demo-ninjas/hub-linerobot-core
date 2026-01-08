@@ -30,7 +30,7 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     , last_motor_update_(0)
     , display_indicator_leds_while_racing_(true)
     , motor_driver_input_voltage_(9.0)
-    , motor_driver_voltage_drop_(0.5)
+    , motor_driver_voltage_drop_(1.4)
     , motor_max_voltage_(6)
     , use_internal_timers_(use_internal_timers)
     , ip_address_("")
@@ -862,8 +862,8 @@ int LineRobotBoard::motorSpeedFromPercentage(int percentage) const {
 
     // Scale the percentage to motor speed range
     float max_speed = (float)motor_max_voltage_ / ((float)motor_driver_input_voltage_ - (float)motor_driver_voltage_drop_) * (float)MAX_MOTOR_SPEED;
-    
     int val = static_cast<int>(std::round(((float)percentage / 100.0) * max_speed));
+    // logDebug("Max motor speed calculated as: " + String(max_speed) + ", Setting motor speed to: " + String(val) + " for percentage: " + String(percentage) + "%");
     // logger_->println("Converted percentage " + String(percentage) + "% to motor speed " + String(val) + " (Max Speed: " + String(max_speed) + ")");
     return val;
 }
