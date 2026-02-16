@@ -616,12 +616,12 @@ void LineRobotBoard::tick1() {
     // Process the motor ramping at 250Hz (every 4th tick)
     if (tick1_count_ % 4 == 0) {
         // logDebug("Ramping motors to targets: L=" + String(target_motor_speed_left_) + " R=" + String(target_motor_speed_right_));
-        int16_t current_left_speed = getMotorSpeedLeft();
+        int16_t current_left_speed = state_ ? state_->motor_speed_left : 0;
         // logDebug("Current motor speeds: L=" + String(current_left_speed) + " R=" + String(getMotorSpeedRight()));
         if (target_motor_speed_left_ != current_left_speed) {
             rampMotorSpeed(true, target_motor_speed_left_, current_left_speed, ramp_speed_diff_per_ms_left_);
         }
-        int16_t current_right_speed = getMotorSpeedRight();
+        int16_t current_right_speed = state_ ? state_->motor_speed_right : 0;
         if (target_motor_speed_right_ != current_right_speed) {
             rampMotorSpeed(false, target_motor_speed_right_, current_right_speed, ramp_speed_diff_per_ms_right_);
         }
@@ -931,8 +931,8 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
     }
     
     int16_t speed_diff = abs(speed) - abs(motor->getSpeed());
-    if (speed_diff > 30 && ramp_time_ms < 16) {
-        // Force a ramp time of at least 16ms for large speed changes to avoid back EMS spikes froom the spinning motor
+    if (speed_diff > 40 && ramp_time_ms < 16) {
+        // Force a ramp time of at least 16ms for large speed changes to avoid back EMS spikes from the spinning motor (particularly when reversing the direction)
         ramp_time_ms = 16;
     }
 
@@ -970,7 +970,7 @@ void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t 
         return;
     }
     if (ramp_speed_diff_per_ms == 0) {
-        // No ramping needed - jumop to target speed
+        // No ramping needed - jump to target speed
         if (is_left) {
             motor_left_->setSpeed(target_speed);
             if (state_) state_->motor_speed_left = target_speed;
@@ -988,24 +988,28 @@ void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t 
         elapsed_ms = 1;  // Ensure at least 1ms has elapsed
     }
 
-    int16_t speed_change = static_cast<int16_t>(ramp_speed_diff_per_ms * elapsed_ms);
+    int16_t speed_change = ceil(ramp_speed_diff_per_ms * elapsed_ms);
     if (target_speed < current_speed && speed_change > 0) {
         speed_change = -speed_change;  // Force Deceleration
     }
     int16_t new_speed = current_speed + speed_change;
-    if ((ramp_speed_diff_per_ms > 0 && new_speed > target_speed) || 
-        (ramp_speed_diff_per_ms < 0 && new_speed < target_speed)) {
+    if ((speed_change > 0 && new_speed > target_speed) || 
+        (speed_change < 0 && new_speed < target_speed)) {
         new_speed = target_speed;  // Clamp to target speed
     }
 
     if (is_left) {
-        // logDebug("Ramping Left Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
+        // logDebug("Ramping Left Motor Speed to " + String(new_speed) + ", Speed Change: " + String(speed_change) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
         motor_left_->setSpeed(new_speed);
-        if (state_) state_->motor_speed_left = new_speed;
+        if (state_) {
+            state_->motor_speed_left = new_speed;
+        }
     } else {
-        // logDebug("Ramping Right Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
+        // logDebug("Ramping Right Motor Speed to " + String(new_speed) + ", Speed Change: " + String(speed_change) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
         motor_right_->setSpeed(new_speed);
-        if (state_) state_->motor_speed_right = new_speed;
+        if (state_) {
+            state_->motor_speed_right = new_speed;
+        }
     }
 
     last_motor_update_ = now;
