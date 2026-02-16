@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <esp_task_wdt.h>
 #include "esp_wifi.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger, 
                               const String& wifi_ssid, const String& wifi_password, 
@@ -30,7 +32,7 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
     , last_motor_update_(0)
     , display_indicator_leds_while_racing_(true)
     , motor_driver_input_voltage_(9.0)
-    , motor_driver_voltage_drop_(1.4)
+    , motor_driver_voltage_drop_(1.4) // 
     , motor_max_voltage_(6)
     , use_internal_timers_(use_internal_timers)
     , ip_address_("")
@@ -53,11 +55,12 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
 
 
     // Initialise Serial communication
-    Serial.begin(9600);  // Whilst a higher baud rate should be used for better performance, it seems to be problematic on the robot board hardware
+    Serial.begin(115200);  // High speed for non-blocking logging
     
     // Initialise I2C Bus
     Wire.begin(15, 16);         // SDA, SCL pins for Robot Board
     Wire.setClock(100000);      // The slower 100kHz is more stable on the ESP32S3
+    Wire.setTimeOut(10);        // 10ms timeout prevents infinite hangs if bus crashes
     delay(50);  // Allow I2C bus to stabilize
     esp_task_wdt_reset();
 
@@ -140,7 +143,10 @@ LineRobotBoard::LineRobotBoard(LineRobotState* state, CachingPrinter& logger,
 }
 
 LineRobotBoard::~LineRobotBoard() {
-    // Proper cleanup sequence
+    // Set the motors to 0 and pause briefly to allow them to ramp down
+    setMotorSpeedBoth(0, 32);  // Ramp down over 32ms
+    delay(50);  // Wait a bit longer than the ramp time
+
     end();  // Stop all timers and tasks first
     
     // Stop motors for safety
@@ -178,6 +184,9 @@ bool LineRobotBoard::begin(uint16_t ir_threshold) {
     }
     
     logDebug("Line Robot Board: Starting initialization...");
+    
+    // Disable Brownout Detector to prevent resets when 3.3V rail sags due to thermal throttling
+    // WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
     
     delay(100); // Just hang 10 for a bit, we're going to be accessing the NVS shortly and that can be slow and trigger issues with the cached memory'
     // Feed the watchdog to prevent timeout during initialization
@@ -321,13 +330,13 @@ bool LineRobotBoard::setupTimersAndTasks() {
     esp_task_wdt_reset();
     
     // Create high-frequency task (1kHz) on Core 1
-    // Stack size: 4096 bytes, Priority: 2 (higher than loop)
+    // Stack size: 8192 bytes, Priority: High
     BaseType_t result = xTaskCreatePinnedToCore(
         coreTask0Wrapper,     // Task function
         "CoreTask0",          // Task name
-        8192,                // Stack size (bytes)
+        8192,                 // Stack size (bytes)
         this,                 // Parameter
-        2,                    // Priority
+        6,                    // Priority
         &core_task0_handle_,  // Task handle
         1                     // Core 1
     );
@@ -337,16 +346,16 @@ bool LineRobotBoard::setupTimersAndTasks() {
         return false;
     }
     
-    // Create low-frequency task (62.5Hz) on Core 0
-    // Stack size: 8192 bytes (larger for HTTP server operations), Priority: 1
+    // Create low-frequency task (62.5Hz) on Core 1
+    // Stack size: 8192 bytes (larger for HTTP server operations), Priority: 2
     result = xTaskCreatePinnedToCore(
         coreTask1Wrapper,     // Task function
         "CoreTask1",          // Task name
-        16384,                // Stack size (bytes) - increased for HTTP operations
+        10240,                // Stack size (bytes) - increased for HTTP operations
         this,                 // Parameter
-        1,                    // Priority
+        2,                    // Priority
         &core_task1_handle_,  // Task handle
-        0                     // Core 0
+        tskNO_AFFINITY        // Core 1
     );
     
     if (result != pdPASS || core_task1_handle_ == nullptr) {
@@ -604,9 +613,6 @@ void LineRobotBoard::tick1() {
         tickInfraredSensors();
     }
 
-    // Feed the watchdog
-    esp_task_wdt_reset();
-
     // Process the motor ramping at 250Hz (every 4th tick)
     if (tick1_count_ % 4 == 0) {
         // logDebug("Ramping motors to targets: L=" + String(target_motor_speed_left_) + " R=" + String(target_motor_speed_right_));
@@ -619,8 +625,6 @@ void LineRobotBoard::tick1() {
         if (target_motor_speed_right_ != current_right_speed) {
             rampMotorSpeed(false, target_motor_speed_right_, current_right_speed, ramp_speed_diff_per_ms_right_);
         }
-        // Feed the watchdog
-        esp_task_wdt_reset();
     }
 
     // Process accelerometer at ~125Hz (every 8th tick) 
@@ -634,9 +638,6 @@ void LineRobotBoard::tick1() {
         if (shift_register_) {
             shift_register_->push_updates();
         }
-
-        // Feed the watchdog
-        esp_task_wdt_reset();
     }
 
     // Every 60000 ticks (60 seconds), reset tick counter to avoid overflow and also get the stack watermark
@@ -700,9 +701,6 @@ void LineRobotBoard::tick2() {
     if (alt_board_button2_) {
         alt_board_button2_->tick();
     }
-
-    // Feed the watchdog
-    esp_task_wdt_reset();
     
     // Process HTTP connections at ~32Hz (every 2nd tick) with error protection
     if (server_ && (tick2_count_ % 2 == 0)) {
@@ -712,8 +710,6 @@ void LineRobotBoard::tick2() {
             try {
                 if (server_->isRunning()) {
                     server_->tick();
-                    // Feed the watchdog
-                    esp_task_wdt_reset();
                 }
             } catch (...) {
                 logError("HTTP server tick exception caught");
@@ -813,6 +809,7 @@ uint16_t LineRobotBoard::getLEDMask() const {
 
 // OLED Control Methods  
 bool LineRobotBoard::setOLEDLine(uint8_t line, const String& text, bool centered) {
+    std::lock_guard<std::mutex> lock(i2c_mutex_);
     if (!oled_ || line > 5) {
         return false;
     }
@@ -821,6 +818,7 @@ bool LineRobotBoard::setOLEDLine(uint8_t line, const String& text, bool centered
 }
 
 void LineRobotBoard::clearOLED() {
+    std::lock_guard<std::mutex> lock(i2c_mutex_);
     if (oled_) {
         oled_->clear(true);
     }
@@ -932,17 +930,22 @@ bool LineRobotBoard::setMotorSpeedInternal(bool is_left, int16_t speed, uint16_t
         return true;
     }
     
+    int16_t speed_diff = abs(speed) - abs(motor->getSpeed());
+    if (speed_diff > 30 && ramp_time_ms < 16) {
+        // Force a ramp time of at least 16ms for large speed changes to avoid back EMS spikes froom the spinning motor
+        ramp_time_ms = 16;
+    }
+
     if (is_left) {
         target_motor_speed_left_ = speed;
-        int16_t speed_diff = abs(speed) - abs(motor->getSpeed());
         ramp_speed_diff_per_ms_left_ = (ramp_time_ms != 0) ?  std::ceil(  float(abs(speed_diff)) / float(ramp_time_ms)) : 0;
         // logDebug("Setting Left Motor Target Speed: " + String(speed) + " with ramp time: " + String(ramp_time_ms) + "ms, Diff/ms: " + String(ramp_speed_diff_per_ms_left_) + ", Motor Speed: " + String(motor->getSpeed()) + ", Speed Diff: " + String(speed_diff));
     } else {
         target_motor_speed_right_ = speed;
-        int16_t speed_diff = abs(speed) - abs(motor->getSpeed());
         ramp_speed_diff_per_ms_right_ = (ramp_time_ms != 0) ? std::ceil(  float(abs(speed_diff)) / float(ramp_time_ms)) : 0;
         // logDebug("Setting Right Motor Target Speed: " + String(speed) + " with ramp time: " + String(ramp_time_ms) + "ms, Diff/ms: " + String(ramp_speed_diff_per_ms_right_) + ", Motor Speed: " + String(motor->getSpeed()) + ", Speed Diff: " + String(speed_diff));
     }
+    
 
     if (ramp_time_ms == 0) {
         // Set the motor speed immediately
@@ -970,8 +973,10 @@ void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t 
         // No ramping needed - jumop to target speed
         if (is_left) {
             motor_left_->setSpeed(target_speed);
+            if (state_) state_->motor_speed_left = target_speed;
         } else {
             motor_right_->setSpeed(target_speed);
+            if (state_) state_->motor_speed_right = target_speed;
         }
         // logDebug("No ramping needed for " + String(is_left ? "Left" : "Right") + " Motor");
         return;
@@ -994,11 +999,13 @@ void LineRobotBoard::rampMotorSpeed(bool is_left, int16_t target_speed, int16_t 
     }
 
     if (is_left) {
-        logDebug("Ramping Left Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
+        // logDebug("Ramping Left Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
         motor_left_->setSpeed(new_speed);
+        if (state_) state_->motor_speed_left = new_speed;
     } else {
-        logDebug("Ramping Right Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
+        // logDebug("Ramping Right Motor Speed to " + String(new_speed) + ", Current Speed: " + String(current_speed) + ", Target Speed: " + String(target_speed) + ", Ramp Diff/ms: " + String(ramp_speed_diff_per_ms) + ", Elapsed ms: " + String(elapsed_ms));
         motor_right_->setSpeed(new_speed);
+        if (state_) state_->motor_speed_right = new_speed;
     }
 
     last_motor_update_ = now;

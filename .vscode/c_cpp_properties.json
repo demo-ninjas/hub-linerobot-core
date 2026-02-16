@@ -10,7 +10,6 @@
             "includePath": [
                 "/Users/adam/git/line-robot/hub-linerobot-core/src",
                 "/Users/adam/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src",
-                "/Users/adam/git/line-robot/hub-linerobot-core/.pio/libdeps/esp/TM1637",
                 "/Users/adam/git/line-robot/hub-linerobot-core/.pio/libdeps/esp/hub-robot-http-utils/src",
                 "/Users/adam/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                 "/Users/adam/git/line-robot/hub-linerobot-core/.pio/libdeps/esp/hub-robot-oled/src",
@@ -252,7 +251,6 @@
                 "path": [
                     "/Users/adam/git/line-robot/hub-linerobot-core/src",
                     "/Users/adam/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src",
-                    "/Users/adam/git/line-robot/hub-linerobot-core/.pio/libdeps/esp/TM1637",
                     "/Users/adam/git/line-robot/hub-linerobot-core/.pio/libdeps/esp/hub-robot-http-utils/src",
                     "/Users/adam/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                     "/Users/adam/git/line-robot/hub-linerobot-core/.pio/libdeps/esp/hub-robot-oled/src",
@@ -491,7 +489,7 @@
                 ]
             },
             "defines": [
-                "PLATFORMIO=60118",
+                "PLATFORMIO=60119",
                 "ARDUINO_ESP32S3_DEV",
                 "BOARD_HAS_PSRAM",
                 "ARDUINO_USB_MODE=1",

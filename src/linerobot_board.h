@@ -386,7 +386,7 @@ public:
          * @return true if speed was set successfully
          * @note This function is thread-safe
          */
-        bool setMotorSpeedRight(int16_t speed, uint16_t ramp_time_ms = 0);
+        bool setMotorSpeedRight(int16_t speed, uint16_t ramp_time_ms = 16);
 
         /**
          * @brief Set the percentage speed of both motors to the same value
@@ -394,7 +394,7 @@ public:
          * @param ramp_time_ms Time to ramp to new speed in milliseconds (0 = immediate)
          * @return true if both speeds were set successfully
          */
-        bool setMotorSpeedBoth(int16_t speed, uint16_t ramp_time_ms = 0);
+        bool setMotorSpeedBoth(int16_t speed, uint16_t ramp_time_ms = 16);
 
         /**
          * @brief Set the percentage speed of the left and right motors independently
@@ -403,7 +403,7 @@ public:
          * @param ramp_time_ms Time to ramp to new speed in milliseconds (0 = immediate)
          * @return true if both speeds were set successfully
          */
-        bool setMotorSpeed(int16_t left, int16_t right, uint16_t ramp_time_ms = 0);
+        bool setMotorSpeed(int16_t left, int16_t right, uint16_t ramp_time_ms = 16);
         
         /**
          * @brief Get current left motor percentage speed

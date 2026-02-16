@@ -1,7 +1,7 @@
 {
     "name": "hub-linerobot-core",
     "description": "Base module for the Hub Line Robot",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "dependencies": {
         "hub-robot-core": "https://github.com/demo-ninjas/hub-robot-core.git",
         "hub-robot-http-utils": "https://github.com/demo-ninjas/hub-robot-http-utils.git",
